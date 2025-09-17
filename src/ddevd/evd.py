@@ -9,6 +9,7 @@ quantile function, and return levels for given values.
 """
 
 import scipy.optimize as opt
+import numpy as np
 
 class ExtremeValueDistribution:
     """Base class for extreme value distributions."""
@@ -56,8 +57,13 @@ class ExtremeValueDistribution:
 
     def return_levels(self, return_periods: list[float], **kwargs) -> list[float]:
         """Compute the return levels for a given set of return periods."""
-        quantile_arguments = 1 - 1 / return_periods
-        return [self.quantile(q, **kwargs) for q in quantile_arguments]
+
+        rp = np.asarray(return_periods, dtype=float)
+
+        if np.any(rp <= 1):
+            raise ValueError("Return periods must be > 1.")
+        quantile_arguments = 1.0 - 1.0 / rp
+        return [self.quantile(float(q), **kwargs) for q in quantile_arguments]
 
 
 class DistributionEVD(ExtremeValueDistribution):
