@@ -1,0 +1,18 @@
+[project]
+name = "ddevd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Michael Sandbichler", email = "michael.sandbichler@datalabhell.at" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.3",
+    "scipy>=1.16.2",
+    "tqdm>=4.67.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
