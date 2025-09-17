@@ -53,10 +53,12 @@ class DDEVD(ExtremeValueDistribution):
             The first function is the kernel-PDF, the second the kernel-CDF.
             If None, the standard normal kernel is used.
         """
-        if np.mean([len(d) for d in data]) > 500:
-            raise ValueError("The number of measurements per sample should be less than 500.")
         if len(data) < 1:
             raise ValueError("The number of samples should be at least 1.")
+        if any(len(d) < 1 for d in data):
+            raise ValueError("Each sample should contain at least 1 measurement.")
+        if np.mean([len(d) for d in data]) > 500:
+            raise ValueError("The number of measurements per sample should be less than 500.")
 
         super().__init__(data)
 
@@ -156,7 +158,14 @@ class DDEVD(ExtremeValueDistribution):
 
         Returns:
           np.ndarray: The CDF values.
+
+        Note:
+          If a single value is provided for y, a single value is returned.
         """
+        if np.isscalar(y):
+            scalar_input = True
+        else:
+            scalar_input = False
         y = np.atleast_1d(y)
 
         match mode:
@@ -175,8 +184,12 @@ class DDEVD(ExtremeValueDistribution):
             cdf_values = np.array(
                 [self._cdf_estimate(y, meas, h) ** len(meas) for meas, h in zip(self.data, h, strict=True)]
             )
-        return np.mean(cdf_values, axis=0)
 
+        if scalar_input:
+            return np.mean(cdf_values, axis=0).item()
+
+        return np.mean(cdf_values, axis=0)
+        
     def bootstrap_return_levels(self, return_periods: list[float], n_resample: int = 1000, mode="binwise"):
         """The bootstrap method for the DDEVD.
 
