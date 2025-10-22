@@ -57,7 +57,7 @@ class BandwidthCalculator:
                  use_scaling=False):
         """Initialize the BandwidthCalculator with samples and kernel functions."""
         self.samples = samples
-        self.m = len(samples)
+        self.m = len(self.samples)
         self.n_vec = np.array([len(sample) for sample in self.samples])
         self.kernel_pdf_func = kernel_pdf_func
         self.kernel_cdf_func = kernel_cdf_func
@@ -87,7 +87,7 @@ class BandwidthCalculator:
             for j in range(self.n_vec[i]):
                 self.h_map.append((i, j))
 
-        pooled_data = [x for bin_data in samples for x in bin_data]
+        pooled_data = [x for bin_data in self.samples for x in bin_data]
         if self.use_scaling:
             self.scale_factor = np.quantile(pooled_data, 0.95)
         else:

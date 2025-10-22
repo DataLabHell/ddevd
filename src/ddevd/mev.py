@@ -33,7 +33,6 @@ class MEV(ExtremeValueDistribution):
         self.weibull_dist = []
         for i in range(self.m):
             self.weibull_dist.append(WeibullDistributionML.fit(self.data[i]))
-            print(f"Weibull parameters for measurement {i}: {self.weibull_dist[-1]}")
 
     def cdf(self, x: float) -> float:
         """Return the distribution function of the MEV distribution for a given value.
