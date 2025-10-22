@@ -8,6 +8,7 @@ The class has methods that return the distribution function, probability density
 quantile function, and return levels for given values.
 """
 
+import scipy
 import scipy.optimize as opt
 import numpy as np
 
@@ -100,3 +101,49 @@ class DistributionEVD(ExtremeValueDistribution):
           float: The distribution function of the EVD distribution for the given value.
         """
         return 1 / self.m * sum([self.distribution.cdf(x) ** self.n[i] for i in range(self.m)])
+
+class GEV(ExtremeValueDistribution):
+    """Class for the Generalized Extreme Value Distribution (GEV)."""
+
+    def __init__(self, data: list[list[float]]) -> None:
+        """Initialize the GEV class.
+
+        Args:
+          data (list[list[float]]): The data for which to initialize the GEV class.
+        """
+        super().__init__(data)
+        all_maxima = [max(d) for d in data]
+        all_data = np.array(all_maxima)
+        self.xi, self.mu, self.sigma = scipy.stats.genextreme.fit(all_maxima)
+
+    def cdf(self, x: float) -> float:
+        """Return the distribution function of the GEV distribution for a given value.
+
+        Args:
+           x (float): The value for which to return the distribution function.
+        Returns:
+          float: The distribution function of the GEV distribution for the given value.
+        """
+        return scipy.stats.genextreme.cdf(x, c=self.xi, loc=self.mu, scale=self.sigma)
+
+    def pdf(self, x: float) -> float:
+        """Return the probability density function of the GEV distribution for a given value.
+
+        Args:
+           x (float): The value for which to return the probability density function.
+
+        Returns:
+          float: The probability density function of the GEV distribution for the given value.
+        """
+        return scipy.stats.genextreme.pdf(x, c=self.xi, loc=self.mu, scale=self.sigma)
+
+    def quantile(self, q: float) -> float:
+        """Return the quantile function of the GEV distribution for a given quantile.
+
+        Args:
+           q (float): The quantile for which to return the quantile function.
+
+        Returns:
+          float: The quantile function of the GEV distribution for the given quantile.
+        """
+        return scipy.stats.genextreme.ppf(q, c=self.xi, loc=self.mu, scale=self.sigma)
