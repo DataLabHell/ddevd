@@ -28,8 +28,11 @@ class WeibullDistributionML:
         x = np.asarray(x, dtype=float)
         # if any value is less than or equal to zero, return NaN
         if np.any(x <= 0):
-            logger.warning("Weibull fit failed due to non-positive values in input data. Returning NaN values.")
-            return np.nan, np.nan
+            # if less than 5% of the values are non-positive, log a warning and drop them
+            if np.sum(x <= 0) / len(x) > 0.05:
+                logger.warning(f"Weibull fit failed due to non-positive values in input data ({np.sum(x <= 0)} / {len(x)}). Returning NaN values.")
+                return np.nan, np.nan
+            x = x[x > 0]
         # fit k via MLE
         ln_x = np.log(x)
         k = 1.

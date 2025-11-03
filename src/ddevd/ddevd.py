@@ -31,8 +31,8 @@ class DDEVD(ExtremeValueDistribution):
         h_opt_position: str | int | float = "global",
         kernel_functions: tuple[Callable, Callable] = None,
         target_distribution = scipy.stats.norm,
-        max_bins: int = 100,
-        use_scaling: bool = False
+        max_bins: int | None = None,
+        use_scaling: bool = False,
     ) -> None:
         """Initialize the DDEVD class.
 
@@ -57,8 +57,6 @@ class DDEVD(ExtremeValueDistribution):
             raise ValueError("The number of samples should be at least 1.")
         if any(len(d) < 1 for d in data):
             raise ValueError("Each sample should contain at least 1 measurement.")
-        if np.max([len(d) for d in data]) > 500:
-            raise ValueError("The number of measurements per sample should be less than 500.")
         
         data = [np.array(d, dtype=float) for d in data if len(d) >= 10]
         if len(data) != len(data):
@@ -80,7 +78,7 @@ class DDEVD(ExtremeValueDistribution):
         logger.info("Starting optimal bandwidth calculation.")
 
         self.bw_calcs = []
-        if len(data) > max_bins:
+        if max_bins is not None and len(data) > max_bins:
             number_of_bins = len(data) // max_bins + 1
             elements_per_bin = len(data) // number_of_bins
             num_bins_revised = len(data) // elements_per_bin + 1
@@ -107,6 +105,7 @@ class DDEVD(ExtremeValueDistribution):
                         use_scaling=use_scaling
                     )
                 )
+            
             self.h_bin_estimates = np.concatenate([bw_calc.compute_optimal_binwise_bandwidth() for bw_calc in self.bw_calcs])
             self.h_global_estimate = np.mean([bw_calc.compute_optimal_global_bandwidth() for bw_calc in self.bw_calcs])
         else:
@@ -119,6 +118,7 @@ class DDEVD(ExtremeValueDistribution):
                 target_distribution=target_distribution,
                 use_scaling=use_scaling
             )]
+
             self.h_bin_estimates = self.bw_calcs[0].compute_optimal_binwise_bandwidth()
             self.h_global_estimate = self.bw_calcs[0].compute_optimal_global_bandwidth()
         if self.h_global_estimate is None:

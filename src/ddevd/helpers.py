@@ -72,7 +72,7 @@ def get_empirical_return_periods(extreme_values):
 
     return sorted_magnitudes, return_periods
 
-def ddevd_weibull_kernel(data: list[list[float]]) -> tuple[Callable, Callable]:
+def ddevd_weibull_kernel(data: list[list[float]] | None = None, shape: float | None = None) -> tuple[Callable, Callable]:
     """Return the kernel functions for the Weibull distribution.
 
     Args:
@@ -81,6 +81,14 @@ def ddevd_weibull_kernel(data: list[list[float]]) -> tuple[Callable, Callable]:
     Returns:
       tuple[Callable, Callable]: The kernel functions for the Weibull distribution.
     """
+    if data is None and shape is None:
+        raise ValueError("Either data or shape must be provided.")
+    if shape is not None:
+        logger.info(f"Using provided shape parameter: {shape}")
+        return (
+            lambda x: weibull_min.pdf(x + gamma(1 + 1 / shape), shape),
+            lambda x: weibull_min.cdf(x + gamma(1 + 1 / shape), shape),
+        )
     full_data = np.concatenate(data)
     shape_param, _ = WeibullDistributionML.fit(full_data)
     logger.info(f"Shape parameter: {shape_param}")
