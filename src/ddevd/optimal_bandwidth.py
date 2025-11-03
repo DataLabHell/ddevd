@@ -54,7 +54,9 @@ class BandwidthCalculator:
                  kernel_cdf_func,
                  optimization_position="global",
                  target_distribution=scipy.stats.norm,
-                 use_scaling=False):
+                 use_scaling=False,
+                 verbose_compute=False,
+                 no_distribution_fit=False):
         """Initialize the BandwidthCalculator with samples and kernel functions."""
         self.samples = samples
         self.m = len(self.samples)
@@ -64,6 +66,7 @@ class BandwidthCalculator:
         self.optimization_position = optimization_position
         self.target_distribution = target_distribution
         self.use_scaling = use_scaling
+        self.verbose_compute = verbose_compute
         logging.info("Scaling mode: %s", "Enabled" if use_scaling else "Disabled")
 
         self.mu_k_1 = scipy.integrate.quad(lambda u: u * kernel_pdf_func(u), -np.inf, np.inf)[0]
@@ -86,6 +89,12 @@ class BandwidthCalculator:
         for i in range(self.m):
             for j in range(self.n_vec[i]):
                 self.h_map.append((i, j))
+
+        if no_distribution_fit:
+            self.pdf = target_distribution.pdf
+            self.cdf = target_distribution.cdf
+            self.pdf_prime = lambda y, delta=1e-6: (self.pdf(y + delta) - self.pdf(y - delta)) / (2 * delta)
+            return
 
         pooled_data = [x for bin_data in self.samples for x in bin_data]
         if self.use_scaling:
@@ -339,6 +348,24 @@ class BandwidthCalculator:
             - 2 * self.E_2b_i(y, n_i, n_i) * self.E_0_i(y, n_i, n_i)
             - self.E_1_i(y, n_i, n_i) ** 2
         )
+    
+    @staticmethod
+    def find_upper_lower_limits(func, start_lower, start_upper,
+                                start_step = 1.0,
+                                threshold_lower = 1e-6,
+                                threshold_upper = 1 - 1e-6):
+        """Finds approximate upper and lower limits for F_X integration"""
+        lower = start_lower
+        upper = start_upper
+        step = start_step
+        while func(lower) > threshold_lower:
+            lower -= step
+            step *= 2
+        while func(upper) < threshold_upper:
+            upper += step
+            step *= 2
+        return lower, upper
+
 
     ### Coefficient computation
     def c(self):
@@ -355,21 +382,13 @@ class BandwidthCalculator:
             return 2 * sum_b_0(y, n_vec) * self.b_1_i(y, n_vec[i]) + self.V_1_i(y, n_vec[i])
 
         if self.optimization_position == "global":
+            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100)
+            logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
                     c_i,
-                    scipy.optimize.brentq(
-                        lambda y, i=i: np.exp(self.cdf(y) - 1e-6) - 1,
-                        -100,
-                        10000,
-                        xtol=1,
-                    ),
-                    scipy.optimize.brentq(
-                        lambda y, i=i: np.exp(self.cdf(y) - 1 + 1e-6) - 1,
-                        -100,
-                        10000,
-                        xtol=1,
-                    ),
+                    lower,
+                    upper,
                     args=(
                         n_vec,
                         i,
@@ -380,21 +399,13 @@ class BandwidthCalculator:
         # if optimization position is a number use it as argument of c_i
         if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
             q = float(self.optimization_position.split("_")[1])
+            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
+            logger.info("Integration limits for c_i[%s]: %s, %s", i, lower, upper)
             return [
                 scipy.integrate.quad(
                     c_i,
-                    scipy.optimize.brentq(
-                        lambda y, q=q: np.exp(self.cdf(y) - q) - 1,
-                        -1000,
-                        100000,
-                        xtol=0.1,
-                    ),
-                    scipy.optimize.brentq(
-                        lambda y, i=i: np.exp(self.cdf(y) - 1 + 1e-6) - 1,
-                        -1000,
-                        100000,
-                        xtol=1,
-                    ),
+                    lower,
+                    upper,
                     args=(
                         n_vec,
                         i,
@@ -436,18 +447,7 @@ class BandwidthCalculator:
         for k in range(len(n_vec)):
             for r in range(len(n_vec)):
                 if self.optimization_position == "global":
-                    lower_limit = scipy.optimize.brentq(
-                        lambda y, k=k: np.exp(self.cdf(y) - 1e-6) - 1,
-                        -10000,
-                        100000,
-                        xtol=1e-6,
-                    )
-                    upper_limit = scipy.optimize.brentq(
-                        lambda y, k=k: np.exp(self.cdf(y) - 1 + 1e-6) -1,
-                        -10000,
-                        100000,
-                        xtol=1e-6,
-                    )
+                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
                         lower_limit,
@@ -459,18 +459,8 @@ class BandwidthCalculator:
                     Q[k, r] = q_fun(self.optimization_position, k, r)
                 elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
                     q = float(self.optimization_position.split("_")[1])
-                    lower_limit = scipy.optimize.brentq(
-                        lambda y, q=q: np.exp(self.cdf(y) - q) - 1,
-                        -10000,
-                        100000,
-                        xtol=1e-6,
-                    )
-                    upper_limit = scipy.optimize.brentq(
-                        lambda y, k=k: np.exp(self.cdf(y) - 1 + 1e-6) - 1,
-                        -10000,
-                        100000,
-                        xtol=1e-6,
-                    )
+                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
+                    logger.info("Integration limits for Q[%s, %s]: %s, %s", k, r, lower_limit, upper_limit)
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
                         lower_limit,
@@ -484,6 +474,23 @@ class BandwidthCalculator:
         logger.info("Q matrix computed: %s", Q)
         return Q
 
+    def D(self):
+        """Compute the D value."""
+        n = np.mean(self.n_vec)
+        def q_fun(y):
+            additional_term = (
+                    2
+                    * self.m * self.b_0_i(y, n)
+                    * (self.b_2a_i(y, n) + self.b_2b_i(y, n))
+                )
+            additional_term += self.V_2a_i(y, n) + self.V_2b_i(y, n)
+            return self.m * self.b_1_i(y, n) ** 2 + additional_term
+        
+        # find the correct integration limits
+        lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
+        logger.info("Integration limits found: %s, %s", lower_limit, upper_limit)
+        return scipy.integrate.quad(q_fun, lower_limit, upper_limit)[0]
+
     def compute_optimal_global_bandwidth(self):
         """Compute the optimal bandwidth for the given samples."""
         lin = np.sum(self.c())
@@ -493,7 +500,7 @@ class BandwidthCalculator:
         logger.info("Optimal global bandwidth (after rescaling): %s", bandwidth * self.scale_factor)
         if bandwidth < 0:
             logger.warning("Negative global bandwidth detected.")
-            bandwidth = None
+            return None
         return bandwidth * self.scale_factor
 
     def compute_optimal_binwise_bandwidth(self):
@@ -502,16 +509,18 @@ class BandwidthCalculator:
         q_matrix = self.Q()
         logger.info("Coefficients: %s", coeffs)
         logger.info("Q matrix: %s", q_matrix)
-        # compute the spectral decomposition of the Q matrix
-        try:
-            eigvals, eigvecs = np.linalg.eigh(q_matrix)
-        except np.linalg.LinAlgError as e:
-            logger.error("Error in computing eigenvalues/eigenvectors: %s", e)
-            raise
-        # check if the matrix is positive definite
-        logger.info("Eigenvalues: %s", eigvals)
-        logger.info("Trace: %s", np.trace(q_matrix))
-        logger.info("Determinant: %s", np.linalg.det(q_matrix))
+        if self.verbose_compute:
+            logger.info("Computing spectral decomposition of Q matrix...")
+            # compute the spectral decomposition of the Q matrix
+            try:
+                eigvals, eigvecs = np.linalg.eigh(q_matrix)
+            except np.linalg.LinAlgError as e:
+                logger.error("Error in computing eigenvalues/eigenvectors: %s", e)
+                raise
+            # check if the matrix is positive definite
+            logger.info("Eigenvalues: %s", eigvals)
+            logger.info("Trace: %s", np.trace(q_matrix))
+            logger.info("Determinant: %s", np.linalg.det(q_matrix))
 
         optimal_bandwidth = -0.5 * np.linalg.solve(q_matrix, coeffs)
         logger.info("Optimal bandwidths (before rescaling): %s", optimal_bandwidth)
