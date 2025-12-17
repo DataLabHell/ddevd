@@ -188,7 +188,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Evaluate DDEVD models")
-    parser.add_argument("--experiment", type=str, choices=["stability", "bandwidth", "benchmark", "nvariance"], required=True,
+    parser.add_argument("--experiment", type=str, choices=["stability", "bandwidth", "benchmark", "nvariance", "cdfcompare"], required=True,
                         help="The experiment to run: 'stability', 'nvariance', 'bandwidth', or 'benchmark'.")
     args = parser.parse_args()
 
@@ -210,7 +210,7 @@ if __name__ == "__main__":
         m_max = 10000
 
         n_range = range(n_min, n_max, 50)
-        m_range = range(m_min, m_max, 10)
+        m_range = range(m_min, m_max, 50)
         for dist_name, dist in used_distributions.items():
             print(f"Evaluating stability condition for distribution: {dist_name}")
             result_matrix = evaluate_stability_condition(dist, n_range, m_range)
@@ -260,6 +260,35 @@ if __name__ == "__main__":
             plt.title(f"Effect of Observation Number Variance on DDEVD Performance, {dist_name} Distribution")
             plt.colorbar(label="MISE")
             plt.savefig(f"observation_variance_effect_{dist_name}.png", dpi=300)
+
+    elif args.experiment == "cdfcompare":
+        for dist_name, dist in used_distributions.items():
+            print(dist_name)
+            data = generate_synthetic_data(
+                num_measurements=20,
+                num_observations=100,
+                observation_num_variance=10,
+                distribution=dist,
+                random_seed=43
+            )
+            results = fit_and_evaluate_models(data)
+            evd_model = DistributionEVD(dist, [len(d) for d in data])
+            lower = min([min(d) for d in data])
+            upper = max([max(d) for d in data])
+            spread = upper - lower
+            lower -= 0.1 * spread
+            upper += 0.5 * spread
+
+            x_values = np.linspace(lower, upper, 500)
+            plt.figure()
+            plt.plot(x_values, evd_model.cdf(x_values), label="True EVD", color='black', linewidth=2)
+            for model_name, model in results.items():
+                plt.plot(x_values, model.cdf(x_values), label=model_name)
+            plt.xlabel("x")
+            plt.ylabel("CDF")
+            plt.title(f"CDF Comparison for {dist_name} Distribution")
+            plt.legend()
+            plt.savefig(f"cdf_comparison_{dist_name}.png", dpi=300)
 
     elif args.experiment == "bandwidth":
         results_table = []
