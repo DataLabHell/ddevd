@@ -53,7 +53,8 @@ def fit_and_evaluate_models(data):
     Returns:
         dict: all models
     """
-    ddevd_model = DDEVD(data)
+    # Use empirical plug-in bandwidths when target_distribution=None
+    ddevd_model = DDEVD(data, target_distribution=None)
     ddevd_weibull_model = DDEVD(data, target_distribution=WeibullDistributionML)
     mev_model = MEV(data)
     gev_model = GEV(data)
@@ -81,6 +82,7 @@ def check_h_opt(distribution, target_distribution = norm):
             random_seed=42
         )
 
+    # allow empirical fallback when target_distribution is None
     ddevd_model = DDEVD(data, target_distribution=target_distribution)
     original_h_global = ddevd_model.h_global_estimate
     evd_model = DistributionEVD(distribution, [len(d) for d in data])
@@ -292,7 +294,7 @@ if __name__ == "__main__":
 
     elif args.experiment == "bandwidth":
         results_table = []
-        target_distributions = {"Normal": norm, "Weibull": weibull_min}
+        target_distributions = {"Empirical": None, "Normal": norm}#, "Weibull": weibull_min}
         
         for targ_name, targ_dist in target_distributions.items():
             for idx, (dist_name, dist) in enumerate(used_distributions.items()):

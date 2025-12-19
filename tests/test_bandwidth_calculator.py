@@ -19,3 +19,22 @@ def test_bandwidth_calculator_binwise():
     if h_vec is not None:
         assert len(h_vec) == len(samples)
         assert all(h > 0 for h in h_vec)
+
+
+def test_bandwidth_calculator_empirical_when_none_target():
+    rng = np.random.default_rng(7)
+    samples = [rng.normal(size=40), rng.normal(loc=1.5, scale=1.2, size=45)]
+
+    bc = BandwidthCalculator(
+        samples,
+        scipy.stats.norm.pdf,
+        scipy.stats.norm.cdf,
+        optimization_position="global",
+        target_distribution=None,
+    )
+
+    # Should not raise and should expose callable pdf/cdf from empirical pilot estimator
+    assert callable(bc.pdf)
+    assert callable(bc.cdf)
+    h_global = bc.compute_optimal_global_bandwidth()
+    assert h_global is None or h_global > 0

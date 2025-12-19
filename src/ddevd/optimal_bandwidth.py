@@ -53,11 +53,15 @@ class BandwidthCalculator:
                  kernel_pdf_func,
                  kernel_cdf_func,
                  optimization_position="global",
-                 target_distribution=scipy.stats.norm,
+                 target_distribution=None,
                  use_scaling=False,
                  verbose_compute=False,
-                 no_distribution_fit=False):
+                 no_distribution_fit=False,
+                 kernel_pdf_prime_func=None,
+                 pilot_factor: float = 1.06,
+                 min_bandwidth: float = 1e-3):
         """Initialize the BandwidthCalculator with samples and kernel functions."""
+        self.use_scaling = use_scaling
         self.samples = samples
         self.m = len(self.samples)
         self.n_vec = np.array([len(sample) for sample in self.samples])
@@ -65,8 +69,10 @@ class BandwidthCalculator:
         self.kernel_cdf_func = kernel_cdf_func
         self.optimization_position = optimization_position
         self.target_distribution = target_distribution
-        self.use_scaling = use_scaling
         self.verbose_compute = verbose_compute
+        self.kernel_pdf_prime_func = kernel_pdf_prime_func or self._default_kernel_pdf_prime
+        self.pilot_factor = pilot_factor
+        self.min_bandwidth = min_bandwidth
         logging.info("Scaling mode: %s", "Enabled" if use_scaling else "Disabled")
 
         self.mu_k_1 = scipy.integrate.quad(lambda u: u * kernel_pdf_func(u), -np.inf, np.inf)[0]
@@ -90,9 +96,22 @@ class BandwidthCalculator:
             for j in range(self.n_vec[i]):
                 self.h_map.append((i, j))
 
+        # default scale factor to 1.0; may be overwritten below
+        self.scale_factor = 1.0
+
+        # If target_distribution is None, fall back to fully empirical plug-in estimator
+        if self.target_distribution is None:
+            self.h_pilot = self._compute_pilot_bandwidths()
+            self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
+            self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
+            self.pdf_prime = functools.lru_cache(maxsize=None)(self._pilot_pdf_prime_scalar)
+            return
+
         if no_distribution_fit:
-            self.pdf = target_distribution.pdf
-            self.cdf = target_distribution.cdf
+            # when no_distribution_fit is requested but no target provided, use standard normal
+            dist = self.target_distribution or scipy.stats.norm
+            self.pdf = dist.pdf
+            self.cdf = dist.cdf
             self.pdf_prime = lambda y, delta=1e-6: (self.pdf(y + delta) - self.pdf(y - delta)) / (2 * delta)
             return
 
@@ -123,15 +142,15 @@ class BandwidthCalculator:
             self.pdf_prime = pdf_prime
 
         else:
-            distribution_fit = target_distribution.fit(scaled_data)
+            distribution_fit = self.target_distribution.fit(scaled_data)
             logger.info("Distribution parameters: %s", distribution_fit)
             @functools.lru_cache(maxsize=None)
             def pdf_est(y):
-                return target_distribution.pdf(y, *distribution_fit)
+                return self.target_distribution.pdf(y, *distribution_fit)
 
             @functools.lru_cache(maxsize=None)
             def cdf_est(y):
-                return target_distribution.cdf(y, *distribution_fit)
+                return self.target_distribution.cdf(y, *distribution_fit)
 
             @functools.lru_cache(maxsize=None)
             def pdf_prime_est(y, delta=1e-6):
@@ -400,7 +419,7 @@ class BandwidthCalculator:
         if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
             q = float(self.optimization_position.split("_")[1])
             lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
-            logger.info("Integration limits for c_i[%s]: %s, %s", i, lower, upper)
+            logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
                     c_i,
@@ -531,6 +550,160 @@ class BandwidthCalculator:
             logger.warning("Negative bandwidths detected.")
             return None
         return optimal_bandwidth * self.scale_factor
+
+    # --- Empirical plug-in helpers (used when target_distribution is None) ---
+    def _default_kernel_pdf_prime(self, u):
+        """Derivative of the kernel PDF with Gaussian fast-path."""
+        if self.kernel_pdf_func is scipy.stats.norm.pdf:
+            return -u * scipy.stats.norm.pdf(u)
+        delta = 1e-5
+        return (self.kernel_pdf_func(u + delta) - self.kernel_pdf_func(u - delta)) / (2 * delta)
+
+    def _compute_pilot_bandwidths(self) -> np.ndarray:
+        """Silverman pilot bandwidth per block with safeguards."""
+        bws = []
+        for sample in self.samples:
+            n = len(sample)
+            if n < 2:
+                raise ValueError("Each sample needs at least two observations for bandwidth estimation.")
+            std = np.std(sample, ddof=1)
+            bw = self.pilot_factor * std * (n ** (-1 / 5))
+
+            if not np.isfinite(bw) or bw <= 0:
+                iqr_val = scipy.stats.iqr(sample)
+                scale = iqr_val / 1.349 if iqr_val > 0 else std
+                bw = self.pilot_factor * scale * (n ** (-1 / 5))
+
+            if not np.isfinite(bw) or bw <= 0:
+                bw = self.min_bandwidth
+
+            bws.append(bw)
+        return np.asarray(bws, dtype=float)
+
+    def _pilot_pdf_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_pdf_func(u) / h)
+        return total / self.m
+
+    def _pilot_cdf_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_cdf_func(u))
+        return total / self.m
+
+    def _pilot_pdf_prime_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_pdf_prime_func(u) / (h ** 2))
+        return total / self.m
+
+
+class EmpiricalBandwidthCalculator(BandwidthCalculator):
+    """Bandwidth calculator that uses a plug-in, fully empirical CDF/PDF estimator.
+
+    This implements the two-stage plug-in approach described in the task:
+    1) Build pilot KDEs (density, CDF, and derivative) using Silverman's rule of thumb
+       per block.
+    2) Substitute the pilot estimates into the alpha/beta functionals and integrate to
+       obtain \hat{c} and \hat{Q}, then compute \hat{h}_{opt} = -1/2 Q^{-1} c.
+    """
+
+    def __init__(
+        self,
+        samples: list[list[float]],
+        kernel_pdf_func,
+        kernel_cdf_func,
+        optimization_position: str | int | float = "global",
+        kernel_pdf_prime_func=None,
+        pilot_factor: float = 1.06,
+        min_bandwidth: float = 1e-3,
+        verbose_compute: bool = False,
+    ) -> None:
+        # Initialize base moments and structural state; skip distribution fitting
+        super().__init__(
+            samples,
+            kernel_pdf_func,
+            kernel_cdf_func,
+            optimization_position=optimization_position,
+            target_distribution=scipy.stats.norm,
+            use_scaling=False,
+            verbose_compute=verbose_compute,
+            no_distribution_fit=True,
+        )
+        self.scale_factor = 1.0
+        self.pilot_factor = pilot_factor
+        self.min_bandwidth = min_bandwidth
+        self.kernel_pdf_prime_func = kernel_pdf_prime_func or self._default_kernel_pdf_prime
+
+        self.h_pilot = self._compute_pilot_bandwidths()
+
+        # Override the distribution-specific callables with pilot KDEs
+        self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
+        self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
+        self.pdf_prime = functools.lru_cache(maxsize=None)(self._pilot_pdf_prime_scalar)
+
+    def _default_kernel_pdf_prime(self, u):
+        """Derivative of the kernel PDF.
+
+        Uses an analytic form for the Gaussian kernel; otherwise falls back to a
+        numerically differentiated kernel PDF.
+        """
+        if self.kernel_pdf_func is scipy.stats.norm.pdf:
+            return -u * scipy.stats.norm.pdf(u)
+        delta = 1e-5
+        return (self.kernel_pdf_func(u + delta) - self.kernel_pdf_func(u - delta)) / (2 * delta)
+
+    def _compute_pilot_bandwidths(self) -> np.ndarray:
+        """Silverman pilot bandwidth per block with small-sample safeguards."""
+        bws = []
+        for sample in self.samples:
+            n = len(sample)
+            if n < 2:
+                raise ValueError("Each sample needs at least two observations for bandwidth estimation.")
+            std = np.std(sample, ddof=1)
+            bw = self.pilot_factor * std * (n ** (-1 / 5))
+
+            if not np.isfinite(bw) or bw <= 0:
+                iqr_val = scipy.stats.iqr(sample)
+                scale = iqr_val / 1.349 if iqr_val > 0 else std
+                bw = self.pilot_factor * scale * (n ** (-1 / 5))
+
+            if not np.isfinite(bw) or bw <= 0:
+                bw = self.min_bandwidth
+
+            bws.append(bw)
+        return np.asarray(bws, dtype=float)
+
+    def _pilot_pdf_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_pdf_func(u) / h)
+        return total / self.m
+
+    def _pilot_cdf_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_cdf_func(u))
+        return total / self.m
+
+    def _pilot_pdf_prime_scalar(self, y: float) -> float:
+        y_val = float(y)
+        total = 0.0
+        for h, sample in zip(self.h_pilot, self.samples, strict=False):
+            u = (y_val - sample) / h
+            total += np.mean(self.kernel_pdf_prime_func(u) / (h ** 2))
+        return total / self.m
 
 if __name__ == "__main__":
     rng = np.random.default_rng(seed=69)
