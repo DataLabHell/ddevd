@@ -68,8 +68,8 @@ class DDEVD(ExtremeValueDistribution):
             raise ValueError("All samples were removed because they contained less than 10 measurements.")
 
         mean_measurement_size = np.mean([len(d) for d in data])
-        if mean_measurement_size > 500:
-            raise ValueError("Mean measurement size too large (>500).")
+        #if mean_measurement_size > 500:
+        #    raise ValueError("Mean measurement size too large (>500).")
 
         super().__init__(data)
 

@@ -73,6 +73,7 @@ class BandwidthCalculator:
         self.kernel_pdf_prime_func = kernel_pdf_prime_func or self._default_kernel_pdf_prime
         self.pilot_factor = pilot_factor
         self.min_bandwidth = min_bandwidth
+        self.iterative = False
         logging.info("Scaling mode: %s", "Enabled" if use_scaling else "Disabled")
 
         self.mu_k_1 = scipy.integrate.quad(lambda u: u * kernel_pdf_func(u), -np.inf, np.inf)[0]
@@ -101,6 +102,8 @@ class BandwidthCalculator:
 
         # If target_distribution is None, fall back to fully empirical plug-in estimator
         if self.target_distribution is None:
+            logger.info("Using empirical pilot estimator for bandwidth calculation.")
+            self.iterative = True
             self.h_pilot = self._compute_pilot_bandwidths()
             self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
             self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
@@ -368,6 +371,22 @@ class BandwidthCalculator:
             - self.E_1_i(y, n_i, n_i) ** 2
         )
     
+    def _clear_all_caches(self):
+        """Clear all LRU caches that depend on self.pdf/cdf/pdf_prime."""
+        if hasattr(self, 'pdf') and hasattr(self.pdf, 'cache_clear'):
+            self.pdf.cache_clear()
+        if hasattr(self, 'cdf') and hasattr(self.cdf, 'cache_clear'):
+            self.cdf.cache_clear()
+        if hasattr(self, 'pdf_prime') and hasattr(self.pdf_prime, 'cache_clear'):
+            self.pdf_prime.cache_clear()
+        # Clear all the E_i, b_i, V_i caches
+        for method_name in ['E_1_i', 'E_2a_i', 'E_2b_i', 'b_0_i', 'b_1_i', 'b_2a_i', 'b_2b_i', 
+                            'V_0_i', 'V_1_i', 'V_2a_i', 'V_2b_i']:
+            if hasattr(self, method_name):
+                method = getattr(self, method_name)
+                if hasattr(method, 'cache_clear'):
+                    method.cache_clear()
+
     @staticmethod
     def find_upper_lower_limits(func, start_lower, start_upper,
                                 start_step = 1.0,
@@ -512,44 +531,100 @@ class BandwidthCalculator:
 
     def compute_optimal_global_bandwidth(self):
         """Compute the optimal bandwidth for the given samples."""
-        lin = np.sum(self.c())
-        qua = np.sum(self.Q())
-        bandwidth = -0.5 * lin / qua
-        logger.info("Optimal global bandwidth (before rescaling): %s", bandwidth)
-        logger.info("Optimal global bandwidth (after rescaling): %s", bandwidth * self.scale_factor)
-        if bandwidth < 0:
-            logger.warning("Negative global bandwidth detected.")
-            return None
-        return bandwidth * self.scale_factor
+        if self.iterative:
+            logger.info("Starting iterative computation for global bandwidth...")
+            prev_h = self.h_pilot
+            early = False
+            lambda_ = 0.5
+            for iteration in range(100):
+                lin = np.sum(self.c())
+                qua = np.sum(self.Q())
+                bandwidth = -0.5 * lin / qua
+                logger.info("Optimal global bandwidth (before rescaling): %s", bandwidth)
+                logger.info("Optimal global bandwidth (after rescaling): %s", bandwidth * self.scale_factor)
+                if bandwidth < 0:
+                    logger.warning("Negative global bandwidth detected.")
+                    return None
+                self.h_pilot = [bandwidth * lambda_ + (1 - lambda_) * prev for prev in prev_h]
+                # Clear caches so updated h_pilot values are used in next iteration
+                self._clear_all_caches()
+                if np.allclose(prev_h, self.h_pilot, rtol=1e-5, atol=1e-8):
+                    logger.info("Converged after %s iterations.", iteration + 1)
+                    early = True
+                    break
+                prev_h = self.h_pilot
+            if not early:
+                logger.info("Maximum iterations reached without convergence.")
+            return bandwidth * self.scale_factor
+        else:
+            lin = np.sum(self.c())
+            qua = np.sum(self.Q())
+            bandwidth = -0.5 * lin / qua
+            logger.info("Optimal global bandwidth (before rescaling): %s", bandwidth)
+            logger.info("Optimal global bandwidth (after rescaling): %s", bandwidth * self.scale_factor)
+            if bandwidth < 0:
+                logger.warning("Negative global bandwidth detected.")
+                return None
+            return bandwidth * self.scale_factor
 
     def compute_optimal_binwise_bandwidth(self):
         """Compute the optimal bandwidth for the given samples."""
-        coeffs = self.c()
-        q_matrix = self.Q()
-        logger.info("Coefficients: %s", coeffs)
-        logger.info("Q matrix: %s", q_matrix)
-        if self.verbose_compute:
-            logger.info("Computing spectral decomposition of Q matrix...")
-            # compute the spectral decomposition of the Q matrix
-            try:
-                eigvals, eigvecs = np.linalg.eigh(q_matrix)
-            except np.linalg.LinAlgError as e:
-                logger.error("Error in computing eigenvalues/eigenvectors: %s", e)
-                raise
-            # check if the matrix is positive definite
-            logger.info("Eigenvalues: %s", eigvals)
-            logger.info("Trace: %s", np.trace(q_matrix))
-            logger.info("Determinant: %s", np.linalg.det(q_matrix))
+        if self.iterative:
+            early = False
+            lambda_ = 0.5
+            logger.info("Starting iterative computation for bin-wise bandwidth...")
+            prev_h = self.h_pilot
+            for iteration in range(100):
+                coeffs = self.c()
+                q_matrix = self.Q()
+                logger.info("Coefficients: %s", coeffs)
+                logger.info("Q matrix: %s", q_matrix)
+                if self.verbose_compute:
+                    logger.info("Computing spectral decomposition of Q matrix...")
+                    # compute the spectral decomposition of the Q matrix
+                    try:
+                        eigvals, eigvecs = np.linalg.eigh(q_matrix)
+                    except np.linalg.LinAlgError as e:
+                        logger.error("Error in computing eigenvalues/eigenvectors: %s", e)
+                        raise
+                    # check if the matrix is positive definite
+                    logger.info("Eigenvalues: %s", eigvals)
+                    logger.info("Trace: %s", np.trace(q_matrix))
+                    logger.info("Determinant: %s", np.linalg.det(q_matrix))
 
-        optimal_bandwidth = -0.5 * np.linalg.solve(q_matrix, coeffs)
-        logger.info("Optimal bandwidths (before rescaling): %s", optimal_bandwidth)
-        logger.info("Optimal bandwidths (after rescaling): %s", optimal_bandwidth * self.scale_factor)
+                optimal_bandwidth = -0.5 * np.linalg.solve(q_matrix, coeffs)
+                logger.info("Optimal bandwidths (before rescaling): %s", optimal_bandwidth)
+                logger.info("Optimal bandwidths (after rescaling): %s", optimal_bandwidth * self.scale_factor)
 
-        # account for negative bandwidths due to numerical errors
-        if np.any(optimal_bandwidth < 0):
-            logger.warning("Negative bandwidths detected.")
-            return None
-        return optimal_bandwidth * self.scale_factor
+                # account for negative bandwidths due to numerical errors
+                if np.any(optimal_bandwidth < 0):
+                    logger.warning("Negative bandwidths detected.")
+                    return None
+                self.h_pilot = lambda_ * optimal_bandwidth + (1 - lambda_) * np.array(self.h_pilot)
+                # Clear caches so updated h_pilot values are used in next iteration
+                self._clear_all_caches()
+                if np.allclose(prev_h, self.h_pilot, rtol=1e-5, atol=1e-8):
+                    logger.info("Converged after %s iterations.", iteration + 1)
+                    early = True
+                    break
+                prev_h = self.h_pilot
+            if not early:
+                logger.info("Maximum iterations reached without convergence.")
+            return optimal_bandwidth * self.scale_factor
+        else:
+            coeffs = self.c()
+            q_matrix = self.Q()
+            logger.info("Coefficients: %s", coeffs)
+            logger.info("Q matrix: %s", q_matrix)
+            optimal_bandwidth = -0.5 * np.linalg.solve(q_matrix, coeffs)
+            logger.info("Optimal bandwidths (before rescaling): %s", optimal_bandwidth)
+            logger.info("Optimal bandwidths (after rescaling): %s", optimal_bandwidth * self.scale_factor)
+
+            # account for negative bandwidths due to numerical errors
+            if np.any(optimal_bandwidth < 0):
+                logger.warning("Negative bandwidths detected.")
+                return None
+            return optimal_bandwidth * self.scale_factor
 
     # --- Empirical plug-in helpers (used when target_distribution is None) ---
     def _default_kernel_pdf_prime(self, u):
@@ -604,108 +679,9 @@ class BandwidthCalculator:
             total += np.mean(self.kernel_pdf_prime_func(u) / (h ** 2))
         return total / self.m
 
-
-class EmpiricalBandwidthCalculator(BandwidthCalculator):
-    """Bandwidth calculator that uses a plug-in, fully empirical CDF/PDF estimator.
-
-    This implements the two-stage plug-in approach described in the task:
-    1) Build pilot KDEs (density, CDF, and derivative) using Silverman's rule of thumb
-       per block.
-    2) Substitute the pilot estimates into the alpha/beta functionals and integrate to
-       obtain \hat{c} and \hat{Q}, then compute \hat{h}_{opt} = -1/2 Q^{-1} c.
-    """
-
-    def __init__(
-        self,
-        samples: list[list[float]],
-        kernel_pdf_func,
-        kernel_cdf_func,
-        optimization_position: str | int | float = "global",
-        kernel_pdf_prime_func=None,
-        pilot_factor: float = 1.06,
-        min_bandwidth: float = 1e-3,
-        verbose_compute: bool = False,
-    ) -> None:
-        # Initialize base moments and structural state; skip distribution fitting
-        super().__init__(
-            samples,
-            kernel_pdf_func,
-            kernel_cdf_func,
-            optimization_position=optimization_position,
-            target_distribution=scipy.stats.norm,
-            use_scaling=False,
-            verbose_compute=verbose_compute,
-            no_distribution_fit=True,
-        )
-        self.scale_factor = 1.0
-        self.pilot_factor = pilot_factor
-        self.min_bandwidth = min_bandwidth
-        self.kernel_pdf_prime_func = kernel_pdf_prime_func or self._default_kernel_pdf_prime
-
-        self.h_pilot = self._compute_pilot_bandwidths()
-
-        # Override the distribution-specific callables with pilot KDEs
-        self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
-        self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
-        self.pdf_prime = functools.lru_cache(maxsize=None)(self._pilot_pdf_prime_scalar)
-
-    def _default_kernel_pdf_prime(self, u):
-        """Derivative of the kernel PDF.
-
-        Uses an analytic form for the Gaussian kernel; otherwise falls back to a
-        numerically differentiated kernel PDF.
-        """
-        if self.kernel_pdf_func is scipy.stats.norm.pdf:
-            return -u * scipy.stats.norm.pdf(u)
-        delta = 1e-5
-        return (self.kernel_pdf_func(u + delta) - self.kernel_pdf_func(u - delta)) / (2 * delta)
-
-    def _compute_pilot_bandwidths(self) -> np.ndarray:
-        """Silverman pilot bandwidth per block with small-sample safeguards."""
-        bws = []
-        for sample in self.samples:
-            n = len(sample)
-            if n < 2:
-                raise ValueError("Each sample needs at least two observations for bandwidth estimation.")
-            std = np.std(sample, ddof=1)
-            bw = self.pilot_factor * std * (n ** (-1 / 5))
-
-            if not np.isfinite(bw) or bw <= 0:
-                iqr_val = scipy.stats.iqr(sample)
-                scale = iqr_val / 1.349 if iqr_val > 0 else std
-                bw = self.pilot_factor * scale * (n ** (-1 / 5))
-
-            if not np.isfinite(bw) or bw <= 0:
-                bw = self.min_bandwidth
-
-            bws.append(bw)
-        return np.asarray(bws, dtype=float)
-
-    def _pilot_pdf_scalar(self, y: float) -> float:
-        y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_pdf_func(u) / h)
-        return total / self.m
-
-    def _pilot_cdf_scalar(self, y: float) -> float:
-        y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_cdf_func(u))
-        return total / self.m
-
-    def _pilot_pdf_prime_scalar(self, y: float) -> float:
-        y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_pdf_prime_func(u) / (h ** 2))
-        return total / self.m
-
 if __name__ == "__main__":
+    # set logging level to info
+    #logging.basicConfig(level=logging.INFO)
     rng = np.random.default_rng(seed=69)
     samples = []
     samples.append(rng.normal(loc=0, scale=5, size=100))
@@ -723,3 +699,35 @@ if __name__ == "__main__":
 
     optimal_binwise_bandwidth = bandwidth_calculator.compute_optimal_binwise_bandwidth()
     print("Optimal binwise bandwidth:", optimal_binwise_bandwidth)
+
+    gauss_bandwidth_calculator = BandwidthCalculator(samples, kernel_pdf_func, kernel_cdf_func, target_distribution=scipy.stats.norm)
+    optimal_global_bandwidth = gauss_bandwidth_calculator.compute_optimal_global_bandwidth()
+    print("Optimal global bandwidth (Gaussian fit):", optimal_global_bandwidth)
+    optimal_binwise_bandwidth = gauss_bandwidth_calculator.compute_optimal_binwise_bandwidth()
+    print("Optimal binwise bandwidth (Gaussian fit):", optimal_binwise_bandwidth)
+
+    samples = []
+    samples.append(rng.standard_cauchy(size=30))
+    samples.append(rng.standard_cauchy(size=30))
+    samples.append(rng.standard_cauchy(size=30))
+    samples.append(rng.standard_cauchy(size=30))
+    samples.append(rng.standard_cauchy(size=21))
+    samples.append(rng.standard_cauchy(size=30))
+
+    kernel_pdf_func = scipy.stats.norm.pdf
+    kernel_cdf_func = scipy.stats.norm.cdf
+
+    # Create an instance of BandwidthCalculator
+    bandwidth_calculator = BandwidthCalculator(samples, kernel_pdf_func, kernel_cdf_func, target_distribution=None)
+
+    optimal_global_bandwidth = bandwidth_calculator.compute_optimal_global_bandwidth()
+    print("Optimal global bandwidth:", optimal_global_bandwidth)
+
+    optimal_binwise_bandwidth = bandwidth_calculator.compute_optimal_binwise_bandwidth()
+    print("Optimal binwise bandwidth:", optimal_binwise_bandwidth)
+
+    gauss_bandwidth_calculator = BandwidthCalculator(samples, kernel_pdf_func, kernel_cdf_func, target_distribution=scipy.stats.norm)
+    optimal_global_bandwidth = gauss_bandwidth_calculator.compute_optimal_global_bandwidth()
+    print("Optimal global bandwidth (Gaussian fit):", optimal_global_bandwidth)
+    optimal_binwise_bandwidth = gauss_bandwidth_calculator.compute_optimal_binwise_bandwidth()
+    print("Optimal binwise bandwidth (Gaussian fit):", optimal_binwise_bandwidth)

@@ -8,7 +8,7 @@ import scipy.stats
 from scipy.stats import weibull_min
 import logging
 
-from ddevd.optimal_bandwidth import EmpiricalBandwidthCalculator
+from ddevd.optimal_bandwidth import BandwidthCalculator
 
 logger = logging.getLogger(__name__)
 # add the loggername to the log messages
@@ -116,7 +116,7 @@ class EmpiricalCDFEstimate:
         else:
             kernel_pdf, kernel_cdf = kernel_functions
 
-        self.bandwidth_calculator = EmpiricalBandwidthCalculator(
+        self.bandwidth_calculator = BandwidthCalculator(
             self.data,
             kernel_pdf,
             kernel_cdf,
