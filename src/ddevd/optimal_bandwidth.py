@@ -60,7 +60,51 @@ class BandwidthCalculator:
                  kernel_pdf_prime_func=None,
                  pilot_factor: float = 1.06,
                  min_bandwidth: float = 1e-3):
-        """Initialize the BandwidthCalculator with samples and kernel functions."""
+        """Initialize the BandwidthCalculator with samples and kernel functions.
+
+        Parameters
+        ----------
+        samples : list[list[float]]
+            A list of one-dimensional sample arrays, one for each margin used
+            in the DDEVD estimation.
+        kernel_pdf_func : callable
+            Probability density function of the kernel. It must accept an array
+            of points and return the corresponding kernel densities.
+        kernel_cdf_func : callable
+            Cumulative distribution function of the kernel corresponding to
+            ``kernel_pdf_func``.
+        optimization_position : {"global", "local"}, optional
+            Strategy used when optimizing the bandwidth. The exact meaning of
+            the options depends on the implementation but typically controls
+            whether a single global bandwidth or position-dependent bandwidths
+            are used.
+        target_distribution : object or None, optional
+            The theoretical target distribution to which the DDEVD estimator is
+            tuned (for example, a SciPy ``rv_continuous`` instance). If
+            provided, it is used directly in the plug-in bandwidth selection.
+            If ``None``, an empirical plug-in estimator with iterative
+            bandwidth selection based solely on the supplied samples is used.
+        use_scaling : bool, optional
+            If True, apply scaling of the data or bandwidths before performing
+            the optimization.
+        verbose_compute : bool, optional
+            If True, enable more verbose logging during bandwidth computation.
+        no_distribution_fit : bool, optional
+            If True, skip fitting a parametric distribution to the data even if
+            a ``target_distribution`` is provided.
+        kernel_pdf_prime_func : callable or None, optional
+            Derivative of ``kernel_pdf_func``. If ``None``, a default
+            derivative implementation (for example, a numerical derivative) is
+            used internally.
+        pilot_factor : float, optional
+            Multiplicative factor applied to the pilot bandwidth used in the
+            plug-in estimation procedure. This controls the smoothness of the
+            pilot estimate that drives the iterative bandwidth selection.
+        min_bandwidth : float, optional
+            Minimum allowed bandwidth value. This lower bound is enforced
+            during optimization to avoid degenerate or numerically unstable
+            bandwidths.
+        """
         self.use_scaling = use_scaling
         self.samples = samples
         self.m = len(self.samples)
@@ -600,7 +644,7 @@ class BandwidthCalculator:
                 if np.any(optimal_bandwidth < 0):
                     logger.warning("Negative bandwidths detected.")
                     return None
-                self.h_pilot = lambda_ * optimal_bandwidth + (1 - lambda_) * np.array(self.h_pilot)
+                self.h_pilot = optimal_bandwidth * lambda_ + (1 - lambda_) * np.array(prev_h)
                 # Clear caches so updated h_pilot values are used in next iteration
                 self._clear_all_caches()
                 if np.allclose(prev_h, self.h_pilot, rtol=1e-5, atol=1e-8):
@@ -650,6 +694,18 @@ class BandwidthCalculator:
                 bw = self.pilot_factor * scale * (n ** (-1 / 5))
 
             if not np.isfinite(bw) or bw <= 0:
+                logger.warning(
+                    (
+                        "Pilot bandwidth computation fell back to min_bandwidth=%s for a sample "
+                        "with n=%d, std=%g, iqr=%g. This often indicates zero variance or "
+                        "numerical issues in the data and may lead to a non-informative "
+                        "bandwidth estimate."
+                    ),
+                    self.min_bandwidth,
+                    n,
+                    std,
+                    iqr_val if 'iqr_val' in locals() else float('nan'),
+                )
                 bw = self.min_bandwidth
 
             bws.append(bw)
@@ -681,7 +737,6 @@ class BandwidthCalculator:
 
 if __name__ == "__main__":
     # set logging level to info
-    #logging.basicConfig(level=logging.INFO)
     rng = np.random.default_rng(seed=69)
     samples = []
     samples.append(rng.normal(loc=0, scale=5, size=100))

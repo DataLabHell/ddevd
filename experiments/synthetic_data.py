@@ -294,7 +294,7 @@ if __name__ == "__main__":
 
     elif args.experiment == "bandwidth":
         results_table = []
-        target_distributions = {"Empirical": None, "Normal": norm}#, "Weibull": weibull_min}
+        target_distributions = {"Empirical": None, "Normal": norm}
         
         for targ_name, targ_dist in target_distributions.items():
             for idx, (dist_name, dist) in enumerate(used_distributions.items()):

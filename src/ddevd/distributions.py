@@ -122,6 +122,7 @@ class EmpiricalCDFEstimate:
             kernel_cdf,
             optimization_position=optimization_position,
             kernel_pdf_prime_func=kernel_pdf_prime,
+            target_distribution=None,
         )
 
         self.h_bin_estimates = self.bandwidth_calculator.compute_optimal_binwise_bandwidth()

@@ -67,10 +67,6 @@ class DDEVD(ExtremeValueDistribution):
         if len(data) == 0:
             raise ValueError("All samples were removed because they contained less than 10 measurements.")
 
-        mean_measurement_size = np.mean([len(d) for d in data])
-        #if mean_measurement_size > 500:
-        #    raise ValueError("Mean measurement size too large (>500).")
-
         super().__init__(data)
 
         self.kernel_pdf = kernel_functions[0] if kernel_functions is not None else norm.pdf
