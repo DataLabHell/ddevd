@@ -120,6 +120,11 @@ class BandwidthCalculator:
         self.iterative = False
         logging.info("Scaling mode: %s", "Enabled" if use_scaling else "Disabled")
 
+        pooled_data = [x for bin_data in self.samples for x in bin_data]
+        self.data_min = float(np.min(pooled_data)) if pooled_data else 0.0
+        self.data_max = float(np.max(pooled_data)) if pooled_data else 0.0
+        self.data_span = max(self.data_max - self.data_min, self.min_bandwidth)
+
         self.mu_k_1 = scipy.integrate.quad(lambda u: u * kernel_pdf_func(u), -np.inf, np.inf)[0]
         self.mu_k_2 = scipy.integrate.quad(lambda u: u**2 * kernel_pdf_func(u), -np.inf, np.inf)[0]
 
@@ -162,7 +167,6 @@ class BandwidthCalculator:
             self.pdf_prime = lambda y, delta=1e-6: (self.pdf(y + delta) - self.pdf(y - delta)) / (2 * delta)
             return
 
-        pooled_data = [x for bin_data in self.samples for x in bin_data]
         if self.use_scaling:
             self.scale_factor = np.quantile(pooled_data, 0.95)
         else:
@@ -448,6 +452,32 @@ class BandwidthCalculator:
             step *= 2
         return lower, upper
 
+    def _integration_limits(self, lower_q=1e-5, upper_q=1 - 1e-5, pad=0.25):
+        """Choose practical integration bounds based on data support and CDF mass."""
+        span = self.data_span if self.data_span > 0 else self.min_bandwidth
+        start_lower = self.data_min - pad * span
+        start_upper = self.data_max + pad * span
+
+        try:
+            lower_val = self.cdf(start_lower)
+            upper_val = self.cdf(start_upper)
+        except Exception:
+            lower_val = None
+            upper_val = None
+
+        if lower_val is None or lower_val > lower_q or upper_val is None or upper_val < upper_q:
+            start_step = max(span * 0.1, self.min_bandwidth)
+            start_lower, start_upper = self.find_upper_lower_limits(
+                self.cdf,
+                start_lower,
+                start_upper,
+                start_step=start_step,
+                threshold_lower=lower_q,
+                threshold_upper=upper_q,
+            )
+
+        return start_lower, start_upper
+
 
     ### Coefficient computation
     def c(self):
@@ -464,7 +494,7 @@ class BandwidthCalculator:
             return 2 * sum_b_0(y, n_vec) * self.b_1_i(y, n_vec[i]) + self.V_1_i(y, n_vec[i])
 
         if self.optimization_position == "global":
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100)
+            lower, upper = self._integration_limits()
             logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
@@ -481,7 +511,7 @@ class BandwidthCalculator:
         # if optimization position is a number use it as argument of c_i
         if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
             q = float(self.optimization_position.split("_")[1])
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
+            lower, upper = self._integration_limits(lower_q=q, upper_q=1 - 1e-6)
             logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
@@ -529,7 +559,7 @@ class BandwidthCalculator:
         for k in range(len(n_vec)):
             for r in range(len(n_vec)):
                 if self.optimization_position == "global":
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
+                    lower_limit, upper_limit = self._integration_limits()
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
                         lower_limit,
@@ -541,7 +571,7 @@ class BandwidthCalculator:
                     Q[k, r] = q_fun(self.optimization_position, k, r)
                 elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
                     q = float(self.optimization_position.split("_")[1])
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
+                    lower_limit, upper_limit = self._integration_limits(lower_q=q, upper_q=1 - 1e-6)
                     logger.info("Integration limits for Q[%s, %s]: %s, %s", k, r, lower_limit, upper_limit)
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
@@ -569,7 +599,7 @@ class BandwidthCalculator:
             return self.m * self.b_1_i(y, n) ** 2 + additional_term
         
         # find the correct integration limits
-        lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
+        lower_limit, upper_limit = self._integration_limits()
         logger.info("Integration limits found: %s, %s", lower_limit, upper_limit)
         return scipy.integrate.quad(q_fun, lower_limit, upper_limit)[0]
 
@@ -769,7 +799,86 @@ if __name__ == "__main__":
     samples.append(rng.standard_cauchy(size=21))
     samples.append(rng.standard_cauchy(size=30))
 
-    kernel_pdf_func = scipy.stats.norm.pdf
+    kernel_pdf_func = scipy.stats.norm.pdf    # ...existing code...
+    class BandwidthCalculator:
+        """Class to compute the optimal bandwidth for DDEVD."""
+        def __init__(self,
+                     samples: list[list[float]],
+                     kernel_pdf_func,
+                     kernel_cdf_func,
+                     optimization_position="global",
+                     target_distribution=None,
+                     use_scaling=False,
+                     verbose_compute=False,
+                     no_distribution_fit=False,
+                     kernel_pdf_prime_func=None,
+                     pilot_factor: float = 1.06,
+                     min_bandwidth: float = 1e-3):
+            # ...existing code...
+            pooled_data = [x for bin_data in self.samples for x in bin_data]
+            self.data_min = float(np.min(pooled_data)) if pooled_data else 0.0
+            self.data_max = float(np.max(pooled_data)) if pooled_data else 0.0
+            self.data_span = max(self.data_max - self.data_min, self.min_bandwidth)
+            # ...existing code...
+        # ...existing code...
+    
+        def _integration_limits(self, lower_q=1e-5, upper_q=1 - 1e-5, pad=0.25):
+            """Tighter integration bounds based on empirical (or scaled) support."""
+            lower = self.data_min - pad * self.data_span
+            upper = self.data_max + pad * self.data_span
+            # If target_distribution is available, refine with its quantiles
+            if self.target_distribution is not None:
+                try:
+                    lower = min(lower, float(self.target_distribution.ppf(lower_q)) * self.scale_factor)
+                    upper = max(upper, float(self.target_distribution.ppf(upper_q)) * self.scale_factor)
+                except Exception:
+                    pass
+            # Fallback to adaptive search if still too tight
+            if self.cdf(lower) > lower_q or self.cdf(upper) < upper_q:
+                lower, upper = self.find_upper_lower_limits(self.cdf, lower, upper, start_step=self.data_span * 0.1,
+                                                            threshold_lower=lower_q, threshold_upper=upper_q)
+            return lower, upper
+    # ...existing code...
+        def c(self):
+            # ...existing code...
+            if self.optimization_position == "global":
+                lower, upper = self._integration_limits()
+                logger.info("Integration limits for c(): %s, %s", lower, upper)
+                return [
+                    scipy.integrate.quad(c_i, lower, upper, args=(n_vec, i))[0]
+                    for i in range(len(n_vec))
+                ]
+            # ...existing code...
+            if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
+                q = float(self.optimization_position.split("_")[1])
+                lower, upper = self._integration_limits(lower_q=q, upper_q=1 - 1e-6)
+                logger.info("Integration limits for c(): %s, %s", lower, upper)
+                return [
+                    scipy.integrate.quad(c_i, lower, upper, args=(n_vec, i))[0]
+                    for i in range(len(n_vec))
+                ]
+            # ...existing code...
+    
+        def Q(self):
+            # ...existing code...
+            for k in range(len(n_vec)):
+                for r in range(len(n_vec)):
+                    if self.optimization_position == "global":
+                        lower_limit, upper_limit = self._integration_limits()
+                        Q[k, r] = scipy.integrate.quad(q_fun, lower_limit, upper_limit, args=(k, r))[0]
+                    elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
+                        q = float(self.optimization_position.split("_")[1])
+                        lower_limit, upper_limit = self._integration_limits(lower_q=q, upper_q=1 - 1e-6)
+                        Q[k, r] = scipy.integrate.quad(q_fun, lower_limit, upper_limit, args=(k, r))[0]
+                    # ...existing code...
+            # ...existing code...
+    
+        def D(self):
+            # ...existing code...
+            lower_limit, upper_limit = self._integration_limits()
+            logger.info("Integration limits found: %s, %s", lower_limit, upper_limit)
+            return scipy.integrate.quad(q_fun, lower_limit, upper_limit)[0]
+    # ...existing code...
     kernel_cdf_func = scipy.stats.norm.cdf
 
     # Create an instance of BandwidthCalculator
