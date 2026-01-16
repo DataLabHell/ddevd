@@ -57,10 +57,15 @@ class DDEVD(ExtremeValueDistribution):
             raise ValueError("The number of samples should be at least 1.")
         if any(len(d) < 1 for d in data):
             raise ValueError("Each sample should contain at least 1 measurement.")
-        
+
+        original_count = len(data)
         data = [np.array(d, dtype=float) for d in data if len(d) >= 10]
-        if len(data) != len(data):
-            logger.warning("Removed %d samples because they contained less than 10 measurements.", len(data) - len(data))
+        removed = original_count - len(data)
+        if removed > 0:
+            logger.warning("Removed %d samples because they contained less than 10 measurements.", removed)
+
+        if len(data) == 0:
+            raise ValueError("All samples were removed because they contained less than 10 measurements.")
 
         super().__init__(data)
 
