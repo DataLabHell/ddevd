@@ -9,8 +9,9 @@ from ddevd.mev import MEV
 from ddevd.evd import DistributionEVD, GEV
 from ddevd.helpers import ddevd_weibull_kernel
 
-from scipy.stats import weibull_min, norm, expon, gumbel_r, pareto, uniform
+from scipy.stats import weibull_min, norm, expon, gumbel_r, pareto, uniform, cauchy
 from scipy.integrate import quad
+from scipy.stats import linregress
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -107,7 +108,7 @@ def check_h_opt(distribution, target_distribution = norm):
         mises.append(mise)
     return mises, h_range, original_h_global
 
-def evaluate_stability_condition(distribution, n_range, m_range):
+def evaluate_stability_condition(distribution, n_range, m_range, known_distribution=True):
     """Evaluate the stability condition of the DDEVD model.
 
     Args:
@@ -129,20 +130,29 @@ def evaluate_stability_condition(distribution, n_range, m_range):
             if j < last_failed_index-1:
                 # lower values succeed, so skip
                 result_matrix[i,j] = 1
-                print("skip at: ", j)
                 continue
-            bw_calculator = BandwidthCalculator([[]], kernel_pdf, kernel_cdf, target_distribution=distribution, no_distribution_fit=True)
-            bw_calculator.m = m
-            bw_calculator.n_vec = np.array([n for _ in range(m)])
-
+            if known_distribution:
+                bw_calculator = BandwidthCalculator([[]], kernel_pdf, kernel_cdf, target_distribution=distribution, no_distribution_fit=True)
+                bw_calculator.m = m
+                bw_calculator.n_vec = np.array([n for _ in range(m)])
+            else:
+                # sample from the distribution
+                data = generate_synthetic_data(
+                    num_measurements=m,
+                    num_observations=n,
+                    observation_num_variance=0,
+                    distribution=distribution
+                )
+                bw_calculator = BandwidthCalculator(data, kernel_pdf, kernel_cdf, target_distribution=None)
+            
             D = bw_calculator.D()
             if D > 0:
                 result_matrix[i,j] = 1
-                print("good: ", D)
+                #print("good: ", D)
                 if j == m_range[-1]:
                     last_failed_index = len(m_range)-1
             else:
-                print("bad: ", D, " at n=", n, " m=", m)
+                #print("bad: ", D, " at n=", n, " m=", m)
                 last_failed_index = j
                 break
 
@@ -186,45 +196,179 @@ def performance_benchmark(distribution, n_samples = 100):
             mises[model_name].append(mise)
     return mises
 
+def get_transition_index_pairs(mat):
+    """Get index pairs where the boolean array transitions from False to True or True to False.
+
+    Args:
+        mat (np.ndarray): 2D boolean array.
+    Returns:
+        list[tuple]: List of index pairs (start_index, end_index) for each transition segment.
+    """
+    transitions = []
+    start_index = 0
+    (rows, cols) = mat.shape
+    prev_i = -1
+    for j in range(cols):
+        for i in range(rows):
+            if i < prev_i:
+                continue
+            if mat[i, j]:
+                transitions.append((i, j))
+                prev_i = i
+                break
+    return transitions
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Evaluate DDEVD models")
-    parser.add_argument("--experiment", type=str, choices=["stability", "bandwidth", "benchmark", "nvariance", "cdfcompare"], required=True,
-                        help="The experiment to run: 'stability', 'nvariance', 'bandwidth', or 'benchmark'.")
+    parser.add_argument("--experiment", type=str, choices=["stability_known", "stability_unknown", "stability_varying", "bandwidth", "benchmark", "nvariance", "cdfcompare"], required=True,
+                        help="The experiment to run: 'stability_known', 'stability_unknown', 'stability_varying', 'nvariance', 'bandwidth', or 'benchmark'.")
     args = parser.parse_args()
 
     used_distributions = {
-        "Weibull0.6": weibull_min(c=0.6, scale=50),
-        "Weibull1.5": weibull_min(c=1.5, scale=50),
-        "Weibull2.5": weibull_min(c=2.5, scale=50),
-        "Uniform": uniform(loc=30, scale=20),
-        "Pareto": pareto(b=30, scale=10),
-        "Exponential": expon(scale=30),
-        "Gumbel": gumbel_r(loc=30, scale=10),
+        #"Weibull0.6": weibull_min(c=0.6, scale=50),
+        #"Weibull1.5": weibull_min(c=1.5, scale=50),
+        #"Weibull2.5": weibull_min(c=2.5, scale=50),
+        #"Uniform": uniform(loc=30, scale=20),
+        "Pareto": pareto(b=2, scale=20),
+
         "Normal": norm(loc=30, scale=10),
+        "Exponential": expon(scale=30),
+        #"Gumbel": gumbel_r(loc=30, scale=10),
+        "Cauchy": cauchy(loc=30, scale=10)
     }
 
-    if args.experiment == "stability":
+    if args.experiment == "stability_known":
         n_min = 100
-        n_max = 10000
+        n_max = 3000
         m_min = 100
-        m_max = 10000
+        m_max = 17500
 
         n_range = range(n_min, n_max, 50)
         m_range = range(m_min, m_max, 50)
         for dist_name, dist in used_distributions.items():
             print(f"Evaluating stability condition for distribution: {dist_name}")
             result_matrix = evaluate_stability_condition(dist, n_range, m_range)
+
+            transition_pairs = get_transition_index_pairs(result_matrix)
+            print("Transition pairs: ", transition_pairs)
+            nrg = np.array(n_range)
+            mrg = np.array(m_range)
+            ns = np.array([nrg[i] for i,j in transition_pairs])
+            ms = np.array([mrg[j] for i,j in transition_pairs])
+
+            log_ns = np.log(ns[len(ns)//4:])  # use upper 3/4 for fitting
+            log_ms = np.log(ms[len(ms)//4:])
+            slope, intercept, r_value, p_value, std_err = linregress(log_ns, log_ms)
+            print(f"Fit stability condition: m = {np.exp(intercept):.2f} * n^{slope:.2f}, R^2 = {r_value**2:.4f}")
+
+            # save the transition pairs for latex plotting
+            with open(f'stability_condition_transition_pairs_{dist_name}.csv', 'w') as f:
+                for n_val, m_val in zip(ns, ms):
+                    fit_m = np.exp(intercept) * n_val**slope
+                    f.write(f"{n_val}, {m_val}, {fit_m}\n")
+
+            # also save the parameters 
+            with open(f'stability_condition_fit_params_{dist_name}.csv', 'w') as f:
+                f.write(f"{np.exp(intercept):.2f} , {slope:.2f}\n")
+            
             with open(f'stability_condition_{dist_name}.npy', 'wb') as f:
                 np.save(f, result_matrix)
             plt.figure()
             plt.imshow(result_matrix.transpose(), extent=[n_min, n_max, m_min, m_max], aspect='auto', origin='lower', cmap='Greys')
-            plt.colorbar(label='Stability Condition Satisfied')
+            plt.plot(ns, np.exp(intercept) * ns**slope, 'b--', label=f'Fitted: m={np.exp(intercept):.2f}*n^{slope:.2f}')
+            plt.legend()
+            plt.colorbar(label='Stability Condition Satisfied (Known Distribution)')
             plt.ylabel('Number of Measurements (m)')
             plt.xlabel('Number of Observations per Measurement (n)')
             plt.title(f'DDEVD Stability Condition Evaluation ({dist_name} Distribution)')
             plt.savefig(f'experiments/results/stability_condition_heatmap_{dist_name}.png', dpi=300)
+
+    if args.experiment == "stability_unknown":
+        n_min = 100
+        n_max = 2000
+        m_min = 100
+        m_max = 5000
+
+        n_range = range(n_min, n_max, 50)
+        m_range = range(m_min, m_max, 50)
+        for dist_name, dist in used_distributions.items():
+            print(f"Evaluating stability condition for distribution: {dist_name}")
+            result_matrix = evaluate_stability_condition(dist, n_range, m_range, known_distribution=False)
+            
+            transition_pairs = get_transition_index_pairs(result_matrix)
+            print("Transition pairs: ", transition_pairs)
+            nrg = np.array(n_range)
+            mrg = np.array(m_range)
+            ns = np.array([nrg[i] for i,j in transition_pairs])
+            ms = np.array([mrg[j] for i,j in transition_pairs])
+            log_ns = np.log(ns[len(ns)//4:])  # use upper 3/4 for fitting
+            log_ms = np.log(ms[len(ms)//4:])
+            slope, intercept, r_value, p_value, std_err = linregress(log_ns, log_ms)
+            print(f"Fitted stability condition: m = {np.exp(intercept):.2f} * n^{slope:.2f}, R^2 = {r_value**2:.4f}")
+
+            with open(f'stability_condition_unknown_{dist_name}.npy', 'wb') as f:
+                np.save(f, result_matrix)
+            plt.figure()
+            plt.imshow(result_matrix.transpose(), extent=[n_min, n_max, m_min, m_max], aspect='auto', origin='lower', cmap='Greys')
+            plt.plot(ns, ms, 'ro')  # Plot the transition points
+            plt.plot(ns, np.exp(intercept) * ns**slope, 'b--', label=f'Fitted: m={np.exp(intercept):.2f}*n^{slope:.2f}')
+            plt.legend()
+            plt.colorbar(label='Stability Condition Satisfied (Unknown Distribution)')
+            plt.ylabel('Number of Measurements (m)')
+            plt.xlabel('Number of Observations per Measurement (n)')
+            plt.title(f'DDEVD Stability Condition Evaluation ({dist_name} Distribution)')
+            plt.savefig(f'experiments/results/stability_condition_heatmap_unknown_{dist_name}.png', dpi=300)
+
+    elif args.experiment == "stability_varying":
+       
+        n_min = 50
+        n_max = 100
+        m_min = 50
+        m_max = 300
+        dist_name = "Normal"
+        distributon = norm(loc=30, scale=10)
+
+        kernel_pdf_func = norm.pdf
+        kernel_cdf_func = norm.cdf
+        n_range = range(n_min, n_max)
+        m_range = range(m_min, m_max)
+        sigma_range = range(0, n_max)
+
+        # for each n and m check when stability is ok fails for sigma
+        print(f"Evaluating varying n stability condition for distribution: {dist_name}")
+
+        from ddevd.optimal_bandwidth import BandwidthCalculator
+        result_matrix = np.zeros((len(n_range), len(m_range)), dtype=float)
+
+        for i, n in tqdm(enumerate(n_range), total=len(n_range), desc="Evaluating stability condition over n and m"):
+            for j, m in enumerate(m_range):
+
+                bw_calculator = BandwidthCalculator([[]], 
+                                                    target_distribution=norm(loc=30, scale=10),
+                                                    kernel_cdf_func=kernel_cdf_func,
+                                                    kernel_pdf_func=kernel_pdf_func,
+                                                    no_distribution_fit=True)
+                for s in sigma_range[::-1]:
+                    random_generator = np.random.default_rng(seed=42)
+                    if s >= n:
+                        bw_calculator.n_vec = np.array([0 for _ in range(m)])
+                        continue
+                    bw_calculator.m = m
+                    bw_calculator.n_vec = np.array([n + int(random_generator.uniform(-s, s)) for _ in range(m)])
+                    #print(bw_calculator.n_vec)
+                    D = bw_calculator.D()
+                    print("n=", n, " m=", m, " sigma=", s, " D=", D)
+                    if D > 0:
+                        result_matrix[i,j] = s/n
+                        break
+                if D <= 0 and s < n:
+                    result_matrix[i,j] = 0  # never stable
+                    break
+
+        plt.imshow(result_matrix.transpose(), extent=[n_min, n_max, m_min, m_max], aspect='auto', origin='lower')
+        plt.show()
 
     elif args.experiment == "nvariance":
         observation_variances = [0, 5, 10, 20, 50]

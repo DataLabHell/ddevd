@@ -8,6 +8,7 @@ import scipy.integrate
 import scipy.optimize
 import scipy.special
 import scipy.stats
+from scipy.stats import gaussian_kde
 
 logger = logging.getLogger(__name__)
 EPS = np.finfo(float).eps
@@ -104,10 +105,21 @@ class BandwidthCalculator:
         if self.target_distribution is None:
             logger.info("Using empirical pilot estimator for bandwidth calculation.")
             self.iterative = True
-            self.h_pilot = self._compute_pilot_bandwidths()
-            self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
-            self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
-            self.pdf_prime = functools.lru_cache(maxsize=None)(self._pilot_pdf_prime_scalar)
+            self.h_pilot = self._compute_pilot_bandwidths().astype(float)
+
+            # Fast path: Gaussian kernel -> scipy gaussian_kde
+            # if self.kernel_pdf_func is scipy.stats.norm.pdf:
+            logger.info("Empirical fast path: scipy gaussian_kde for Gaussian kernel")
+            self._setup_fast_gaussian_kde()
+            self.pdf = functools.lru_cache(maxsize=None)(self._fast_gaussian_pdf)
+            self.cdf = functools.lru_cache(maxsize=None)(self._fast_gaussian_cdf)
+            self.pdf_prime = functools.lru_cache(maxsize=None)(self._fast_gaussian_pdf_prime)
+            # else:
+                # Fallback: vectorized manual KDE
+                # self._build_empirical_cache()
+                # self.pdf = functools.lru_cache(maxsize=None)(self._pilot_pdf_scalar)
+                # self.cdf = functools.lru_cache(maxsize=None)(self._pilot_cdf_scalar)
+                # self.pdf_prime = functools.lru_cache(maxsize=None)(self._pilot_pdf_prime_scalar)
             return
 
         if no_distribution_fit:
@@ -391,8 +403,18 @@ class BandwidthCalculator:
     def find_upper_lower_limits(func, start_lower, start_upper,
                                 start_step = 1.0,
                                 threshold_lower = 1e-6,
-                                threshold_upper = 1 - 1e-6):
-        """Finds approximate upper and lower limits for F_X integration"""
+                                threshold_upper = 1 - 1e-6,
+                                samples: np.ndarray | None = None):
+        """Find approximate integration bounds.
+
+        If samples are provided, use empirical quantiles for tighter bounds; otherwise fallback
+        to expanding search.
+        """
+        if samples is not None and samples.size > 0:
+            lower = np.quantile(samples, max(threshold_lower, 1e-4))
+            upper = np.quantile(samples, min(threshold_upper, 1 - 1e-4))
+            return float(lower), float(upper)
+
         lower = start_lower
         upper = start_upper
         step = start_step
@@ -420,7 +442,7 @@ class BandwidthCalculator:
             return 2 * sum_b_0(y, n_vec) * self.b_1_i(y, n_vec[i]) + self.V_1_i(y, n_vec[i])
 
         if self.optimization_position == "global":
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100)
+            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, samples=getattr(self, '_obs', None))
             logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
@@ -431,13 +453,15 @@ class BandwidthCalculator:
                         n_vec,
                         i,
                     ),
+                    epsabs=1e-4,
+                    epsrel=1e-3,
                 )[0]
                 for i in range(len(n_vec))
             ]
         # if optimization position is a number use it as argument of c_i
         if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
             q = float(self.optimization_position.split("_")[1])
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
+            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q, samples=getattr(self, '_obs', None))
             logger.info("Integration limits for c(): %s, %s", lower, upper)
             return [
                 scipy.integrate.quad(
@@ -448,6 +472,8 @@ class BandwidthCalculator:
                         n_vec,
                         i,
                     ),
+                    epsabs=1e-4,
+                    epsrel=1e-3,
                 )[0]
                 for i in range(len(n_vec))
             ]
@@ -471,6 +497,16 @@ class BandwidthCalculator:
 
         Q = np.zeros((len(n_vec), len(n_vec)))
 
+        # Cache integration bounds once per evaluation for the global/quantile cases
+        lower_upper = None
+        if self.optimization_position == "global":
+            lower_upper = self.find_upper_lower_limits(self.cdf, 100, 100, samples=getattr(self, '_obs', None))
+            logger.info("Integration limits for Q(): %s, %s", *lower_upper)
+        elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
+            q = float(self.optimization_position.split("_")[1])
+            lower_upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q, samples=getattr(self, '_obs', None))
+            logger.info("Integration limits for Q(): %s, %s", *lower_upper)
+
         def q_fun(y, i, j):
             additional_term = 0
             if i == j:
@@ -485,25 +521,25 @@ class BandwidthCalculator:
         for k in range(len(n_vec)):
             for r in range(len(n_vec)):
                 if self.optimization_position == "global":
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
-                        lower_limit,
-                        upper_limit,
+                        lower_upper[0],
+                        lower_upper[1],
                         args=(k, r),
+                        epsabs=1e-4,
+                        epsrel=1e-3,
                     )[0]
                 # if optimization position is a number use it as argument of q_fun
                 elif isinstance(self.optimization_position, (int, float)):
                     Q[k, r] = q_fun(self.optimization_position, k, r)
                 elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
-                    q = float(self.optimization_position.split("_")[1])
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
-                    logger.info("Integration limits for Q[%s, %s]: %s, %s", k, r, lower_limit, upper_limit)
                     Q[k, r] = scipy.integrate.quad(
                         q_fun,
-                        lower_limit,
-                        upper_limit,
+                        lower_upper[0],
+                        lower_upper[1],
                         args=(k, r),
+                        epsabs=1e-4,
+                        epsrel=1e-3,
                     )[0]
                 else:
                     raise ValueError(
@@ -525,15 +561,15 @@ class BandwidthCalculator:
             return self.m * self.b_1_i(y, n) ** 2 + additional_term
         
         # find the correct integration limits
-        lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
+        lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100, samples=getattr(self, '_obs', None))
         logger.info("Integration limits found: %s, %s", lower_limit, upper_limit)
-        return scipy.integrate.quad(q_fun, lower_limit, upper_limit)[0]
+        return scipy.integrate.quad(q_fun, lower_limit, upper_limit, epsabs=1e-4, epsrel=1e-3)[0]
 
     def compute_optimal_global_bandwidth(self):
         """Compute the optimal bandwidth for the given samples."""
         if self.iterative:
             logger.info("Starting iterative computation for global bandwidth...")
-            prev_h = self.h_pilot
+            prev_h = np.asarray(self.h_pilot, dtype=float)
             early = False
             lambda_ = 0.5
             for iteration in range(100):
@@ -545,9 +581,12 @@ class BandwidthCalculator:
                 if bandwidth < 0:
                     logger.warning("Negative global bandwidth detected.")
                     return None
-                self.h_pilot = [bandwidth * lambda_ + (1 - lambda_) * prev for prev in prev_h]
-                # Clear caches so updated h_pilot values are used in next iteration
-                self._clear_all_caches()
+                self.h_pilot = lambda_ * bandwidth + (1 - lambda_) * prev_h
+                # Refresh empirical cache or fast KDE so bandwidths are reflected
+                if hasattr(self, "_kde"):
+                    self._update_fast_gaussian_kde()
+                else:
+                    self._build_empirical_cache()
                 if np.allclose(prev_h, self.h_pilot, rtol=1e-5, atol=1e-8):
                     logger.info("Converged after %s iterations.", iteration + 1)
                     early = True
@@ -573,7 +612,7 @@ class BandwidthCalculator:
             early = False
             lambda_ = 0.5
             logger.info("Starting iterative computation for bin-wise bandwidth...")
-            prev_h = self.h_pilot
+            prev_h = np.asarray(self.h_pilot, dtype=float)
             for iteration in range(100):
                 coeffs = self.c()
                 q_matrix = self.Q()
@@ -600,9 +639,12 @@ class BandwidthCalculator:
                 if np.any(optimal_bandwidth < 0):
                     logger.warning("Negative bandwidths detected.")
                     return None
-                self.h_pilot = lambda_ * optimal_bandwidth + (1 - lambda_) * np.array(self.h_pilot)
-                # Clear caches so updated h_pilot values are used in next iteration
-                self._clear_all_caches()
+                self.h_pilot = lambda_ * optimal_bandwidth + (1 - lambda_) * prev_h
+                # Refresh empirical cache or fast KDE so bandwidths are reflected
+                if hasattr(self, "_kde"):
+                    self._update_fast_gaussian_kde()
+                else:
+                    self._build_empirical_cache()
                 if np.allclose(prev_h, self.h_pilot, rtol=1e-5, atol=1e-8):
                     logger.info("Converged after %s iterations.", iteration + 1)
                     early = True
@@ -654,30 +696,70 @@ class BandwidthCalculator:
 
             bws.append(bw)
         return np.asarray(bws, dtype=float)
+    
+    def _build_empirical_cache(self) -> None:
+        """Precompute flattened arrays for fast empirical KDE evaluations."""
+        # Flatten observations and corresponding bandwidths once
+        self._obs = np.concatenate([np.asarray(s, dtype=float) for s in self.samples])
+        self._h_obs = np.repeat(self.h_pilot, self.n_vec)
 
+        # Per-observation weights implementing the averaging over m and n_i
+        n_repeat = np.repeat(self.n_vec, self.n_vec)
+        m_val = float(self.m)
+        self._weights_pdf = 1.0 / (m_val * n_repeat * self._h_obs)
+        self._weights_cdf = 1.0 / (m_val * n_repeat)
+        self._weights_pdf_prime = 1.0 / (m_val * n_repeat * (self._h_obs ** 2))
+
+        # Clear cached scalar evaluations so subsequent calls use refreshed arrays
+        self._clear_all_caches()
+
+    def _setup_fast_gaussian_kde(self) -> None:
+        """Initialize scipy gaussian_kde for Gaussian kernel fast path."""
+        self._obs = np.concatenate([np.asarray(s, dtype=float) for s in self.samples])
+        if self._obs.size == 0:
+            raise ValueError("Cannot estimate from empty data.")
+        self._std_obs = np.std(self._obs, ddof=1) or 1.0
+        # Use average pilot bandwidth as scale for KDE bw_method
+        avg_bw = float(np.mean(self.h_pilot))
+        bw_method = avg_bw / self._std_obs
+        self._kde = gaussian_kde(self._obs, bw_method=bw_method)
+
+    def _update_fast_gaussian_kde(self) -> None:
+        """Update KDE bandwidth after h_pilot changes."""
+        if hasattr(self, "_kde"):
+            avg_bw = float(np.mean(self.h_pilot))
+            bw_method = avg_bw / (self._std_obs or 1.0)
+            self._kde.set_bandwidth(bw_method)
+            self._clear_all_caches()
+
+    # Fast-path pdf/cdf/pdf' using gaussian_kde
+    def _fast_gaussian_pdf(self, y: float) -> float:
+        return float(self._kde.pdf([y])[0])
+
+    def _fast_gaussian_cdf(self, y: float) -> float:
+        return float(self._kde.integrate_box_1d(-np.inf, y))
+
+    def _fast_gaussian_pdf_prime(self, y: float) -> float:
+        delta = 1e-4
+        return (self._fast_gaussian_pdf(y + delta) - self._fast_gaussian_pdf(y - delta)) / (2 * delta)
+    
+    @functools.lru_cache(maxsize=None)
     def _pilot_pdf_scalar(self, y: float) -> float:
         y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_pdf_func(u) / h)
-        return total / self.m
+        u = (y_val - self._obs) / self._h_obs
+        return float(np.sum(self.kernel_pdf_func(u) * self._weights_pdf))
 
+    @functools.lru_cache(maxsize=None)
     def _pilot_cdf_scalar(self, y: float) -> float:
         y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_cdf_func(u))
-        return total / self.m
-
+        u = (y_val - self._obs) / self._h_obs
+        return float(np.sum(self.kernel_cdf_func(u) * self._weights_cdf))
+    
+    @functools.lru_cache(maxsize=None)
     def _pilot_pdf_prime_scalar(self, y: float) -> float:
         y_val = float(y)
-        total = 0.0
-        for h, sample in zip(self.h_pilot, self.samples, strict=False):
-            u = (y_val - sample) / h
-            total += np.mean(self.kernel_pdf_prime_func(u) / (h ** 2))
-        return total / self.m
+        u = (y_val - self._obs) / self._h_obs
+        return float(np.sum(self.kernel_pdf_prime_func(u) * self._weights_pdf_prime))
 
 if __name__ == "__main__":
     # set logging level to info
