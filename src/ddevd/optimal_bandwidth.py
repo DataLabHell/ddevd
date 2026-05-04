@@ -346,10 +346,14 @@ class BandwidthCalculator:
 
     @functools.lru_cache(maxsize=None)
     def E_1_i(self, y, n, n_i):
-        """Computes the function E_1,i."""
+        """Computes the function E_1,i.
+
+        From the paper: E_{1,N} = FY_{1,N} - N * f_X * mu_{K,1} * FY_{0,N-1}
+        Note: the second term vanishes for symmetric (zero-mean) kernels.
+        """
         if n_i <= 2:
             raise ValueError("n_i cannot be less than or equal to 2.")
-        return -n * self.fy_1(y, n - 1, n_i) * self.pdf(y) * self.mu_k_1 + self.fy_1(y, n, n_i)
+        return self.fy_1(y, n, n_i) - n * self.fy_0(y, n - 1, n_i) * self.pdf(y) * self.mu_k_1
 
     @functools.lru_cache(maxsize=None)
     def E_2a_i(self, y, n, n_i):
@@ -416,20 +420,24 @@ class BandwidthCalculator:
         )
     
     def _clear_all_caches(self):
-        """Clear all LRU caches that depend on self.pdf/cdf/pdf_prime."""
-        if hasattr(self, 'pdf') and hasattr(self.pdf, 'cache_clear'):
-            self.pdf.cache_clear()
-        if hasattr(self, 'cdf') and hasattr(self.cdf, 'cache_clear'):
-            self.cdf.cache_clear()
-        if hasattr(self, 'pdf_prime') and hasattr(self.pdf_prime, 'cache_clear'):
-            self.pdf_prime.cache_clear()
-        # Clear all the E_i, b_i, V_i caches
-        for method_name in ['E_1_i', 'E_2a_i', 'E_2b_i', 'b_0_i', 'b_1_i', 'b_2a_i', 'b_2b_i', 
-                            'V_0_i', 'V_1_i', 'V_2a_i', 'V_2b_i']:
-            if hasattr(self, method_name):
-                method = getattr(self, method_name)
-                if hasattr(method, 'cache_clear'):
-                    method.cache_clear()
+        """Clear all LRU caches on this class.
+
+        ``@functools.lru_cache`` stores its cache on the class-level function
+        object, not on bound methods.  Calling ``cache_clear()`` via a bound
+        method reference silently does nothing; we must go through the
+        unbound class attribute instead.
+        Note: this clears the shared cache for *all* instances.
+        """
+        for method_name in [
+            'E_1_i', 'E_2a_i', 'E_2b_i',
+            'b_0_i', 'b_1_i', 'b_2a_i', 'b_2b_i',
+            'V_0_i', 'V_1_i', 'V_2a_i', 'V_2b_i',
+            'fy_0', 'fy_1', 'fy_2_alpha', 'fy_2_beta',
+            'log_rho', 'factor_z', 'factor_z2',
+        ]:
+            fn = getattr(BandwidthCalculator, method_name, None)
+            if fn is not None and hasattr(fn, 'cache_clear'):
+                fn.cache_clear()
 
     @staticmethod
     def find_upper_lower_limits(func, start_lower, start_upper,
@@ -557,7 +565,16 @@ class BandwidthCalculator:
         return Q
 
     def D(self):
-        """Compute the D value."""
+        """Compute the stability criterion D from Lemma (positive definiteness of Q).
+
+        D = integral of [2*m*b_0(y)*b_2(y) + V_2(y)] dy
+
+        With equal block sizes n_i=n, the Hessian Q has eigenvalues:
+          - a = D  (multiplicity m-1, smallest)
+          - a + m*b  (multiplicity 1, largest)  where b = integral b_1^2 dy
+
+        Q is positive definite iff D > 0 (Lemma in the paper).
+        """
         n = np.mean(self.n_vec)
         def q_fun(y):
             additional_term = (
@@ -566,7 +583,7 @@ class BandwidthCalculator:
                     * (self.b_2a_i(y, n) + self.b_2b_i(y, n))
                 )
             additional_term += self.V_2a_i(y, n) + self.V_2b_i(y, n)
-            return self.m * self.b_1_i(y, n) ** 2 + additional_term
+            return additional_term
         
         # find the correct integration limits
         lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
