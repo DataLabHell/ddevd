@@ -106,7 +106,11 @@ class BandwidthCalculator:
             bandwidths.
         """
         self.use_scaling = use_scaling
-        self.samples = samples
+        # Coerce each sample to a numpy float array.  The pilot KDE helpers
+        # below do ``y_val - sample`` and rely on broadcasting, so a Python
+        # ``list`` here would raise ``TypeError: unsupported operand type(s)
+        # for -: 'float' and 'list'``.
+        self.samples = [np.asarray(s, dtype=float) for s in samples]
         self.m = len(self.samples)
         self.n_vec = np.array([len(sample) for sample in self.samples])
         self.kernel_pdf_func = kernel_pdf_func
@@ -427,17 +431,25 @@ class BandwidthCalculator:
         method reference silently does nothing; we must go through the
         unbound class attribute instead.
         Note: this clears the shared cache for *all* instances.
+
+        In iterative mode the pilot pdf/cdf/pdf_prime are instance-level
+        lru_cache wrappers whose values depend on self.h_pilot, so they must
+        be cleared separately whenever h_pilot changes.
         """
         for method_name in [
             'E_1_i', 'E_2a_i', 'E_2b_i',
             'b_0_i', 'b_1_i', 'b_2a_i', 'b_2b_i',
             'V_0_i', 'V_1_i', 'V_2a_i', 'V_2b_i',
-            'fy_0', 'fy_1', 'fy_2_alpha', 'fy_2_beta',
-            'log_rho', 'factor_z', 'factor_z2',
         ]:
             fn = getattr(BandwidthCalculator, method_name, None)
             if fn is not None and hasattr(fn, 'cache_clear'):
                 fn.cache_clear()
+
+        if self.iterative:
+            for attr in ('pdf', 'cdf', 'pdf_prime'):
+                fn = getattr(self, attr, None)
+                if fn is not None and hasattr(fn, 'cache_clear'):
+                    fn.cache_clear()
 
     @staticmethod
     def find_upper_lower_limits(func, start_lower, start_upper,
@@ -456,65 +468,114 @@ class BandwidthCalculator:
             step *= 2
         return lower, upper
 
+    def _integrate_y(self, integrand, q=None):
+        """Integrate ``integrand(y)`` over the y-axis or, when ``q`` is given,
+        over ``{y : F_X(y) >= q}`` using the change of variables ``t = 1-F_X(y)``.
+
+        For heavy-tailed distributions (Cauchy, Pareto with small alpha, etc.)
+        the right endpoint of the y-axis integral is at ``y -> infty`` and the
+        Jacobian ``1/f_X(y)`` blows up faster than the integrand decays, so plain
+        ``scipy.integrate.quad`` on y picks up O(1/eps) cancellation noise and
+        can return values that disagree with the true integral by orders of
+        magnitude (and by sign).  The Watson-lemma proof in Appendix A.1 works
+        in ``t = 1 - F_X(y)``; for finite-q-MISE integrals this is the natural
+        variable: ``dy = -1/f_X(y) dt`` and the relevant region is
+        ``t in (0, 1-q]``, where the integrand is well-behaved.
+
+        Parameters
+        ----------
+        integrand : callable
+            Function ``y -> R`` to integrate over the y-axis.
+        q : float in (0, 1) or None
+            If ``None``, integrate over (essentially) the full support using
+            the legacy bracketing search.  If a quantile, integrate over
+            ``{y : F_X(y) >= q}`` using the t-substitution when the underlying
+            distribution provides ``ppf`` and ``pdf``; otherwise fall back to
+            a y-axis quad with a finite, n-aware upper limit.
+        """
+        if q is None:
+            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100)
+            return scipy.integrate.quad(integrand, lower, upper)[0]
+
+        if not (0.0 < q < 1.0):
+            raise ValueError("q must be in (0, 1); got {}".format(q))
+
+        ppf = getattr(self.target_distribution, "ppf", None)
+        pdf = getattr(self.target_distribution, "pdf", None)
+        if ppf is None or pdf is None:
+            # Fallback: y-axis quad with a finite-but-not-pathological upper.
+            lower, upper = self.find_upper_lower_limits(
+                self.cdf, 100, 100, threshold_lower=q
+            )
+            try:
+                _, upper_safe = self.find_upper_lower_limits(
+                    self.cdf, 100, 100, threshold_upper=1 - 1e-5
+                )
+                upper = min(upper, float(upper_safe))
+            except Exception:
+                pass
+            return scipy.integrate.quad(integrand, lower, upper)[0]
+
+        # ----- Heavy-tail-safe integration via t = 1 - F_X(y).
+        def t_integrand(t):
+            if t <= 0.0 or t >= 1.0:
+                return 0.0
+            y = float(ppf(1.0 - t))
+            f = float(pdf(y))
+            if f <= 0.0 or not np.isfinite(f):
+                return 0.0
+            v = integrand(y) / f
+            if not np.isfinite(v):
+                return 0.0
+            return v
+
+        t_max = 1.0 - q
+        # Geometrically subdivide near t=0 to help adaptive quad concentrate
+        # samples where the Watson-lemma integrand has its mass.
+        breakpoints = list(np.geomspace(t_max * 1e-6, t_max, num=8))
+        return scipy.integrate.quad(
+            t_integrand, 0.0, t_max, limit=200, points=breakpoints
+        )[0]
+
+    def _resolve_q(self):
+        """Translate ``self.optimization_position`` into either a quantile q
+        in (0, 1) or ``None`` for full-support integration.  Returns
+        (mode, value): mode is one of {'global', 'quantile', 'point'}."""
+        op = self.optimization_position
+        if op == "global":
+            return ("global", None)
+        if isinstance(op, str) and op.startswith("quantile_"):
+            return ("quantile", float(op.split("_")[1]))
+        if isinstance(op, (int, float)):
+            return ("point", float(op))
+        raise ValueError(
+            "Optimization position must be 'global', 'quantile_X' or a number. "
+            "Got: {}".format(op)
+        )
+
 
     ### Coefficient computation
     def c(self):
         """Compute the coefficient vector."""
         n_vec = np.array([len(sample) for sample in self.samples])
         logger.info("Computing coefficients for n_vec: %s", n_vec)
-        # Compute the coefficients
-        def sum_b_0(y, n_vec):
+
+        def sum_b_0(y):
             return np.sum([self.b_0_i(y, n_i) for n_i in n_vec])
 
-        # c_i(y) = 2* sum_b_0 * b_1_i + V_1_i
-        # compute the integral of c_i to get the coefficient
-        def c_i(y, n_vec, i):
-            return 2 * sum_b_0(y, n_vec) * self.b_1_i(y, n_vec[i]) + self.V_1_i(y, n_vec[i])
+        # c_i(y) = 2 * sum_b_0(y) * b_1_i(y) + V_1_i(y)
+        def c_i(y, i):
+            return 2 * sum_b_0(y) * self.b_1_i(y, n_vec[i]) + self.V_1_i(y, n_vec[i])
 
-        if self.optimization_position == "global":
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100)
-            logger.info("Integration limits for c(): %s, %s", lower, upper)
-            return [
-                scipy.integrate.quad(
-                    c_i,
-                    lower,
-                    upper,
-                    args=(
-                        n_vec,
-                        i,
-                    ),
-                )[0]
-                for i in range(len(n_vec))
-            ]
-        # if optimization position is a number use it as argument of c_i
-        if isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
-            q = float(self.optimization_position.split("_")[1])
-            lower, upper = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
-            logger.info("Integration limits for c(): %s, %s", lower, upper)
-            return [
-                scipy.integrate.quad(
-                    c_i,
-                    lower,
-                    upper,
-                    args=(
-                        n_vec,
-                        i,
-                    ),
-                )[0]
-                for i in range(len(n_vec))
-            ]
-        if isinstance(self.optimization_position, (int, float)):
-            return [
-                c_i(
-                    self.optimization_position,
-                    n_vec,
-                    i,
-                )
-                for i in range(len(n_vec))
-            ]
-        raise ValueError(
-            "Optimization position must be 'global', 'quantile_x' or a number. Got: {}".format(self.optimization_position)
-        )
+        mode, value = self._resolve_q()
+        if mode == "point":
+            return [c_i(value, i) for i in range(len(n_vec))]
+        q_arg = None if mode == "global" else value
+        logger.info("c(): integration mode=%s, q=%s", mode, q_arg)
+        return [
+            self._integrate_y(lambda y, i=i: c_i(y, i), q=q_arg)
+            for i in range(len(n_vec))
+        ]
 
     def Q(self):
         """Compute the Q matrix."""
@@ -534,48 +595,53 @@ class BandwidthCalculator:
                 additional_term += self.V_2a_i(y, n_vec[i]) + self.V_2b_i(y, n_vec[i])
             return self.b_1_i(y, n_vec[i]) * self.b_1_i(y, n_vec[j]) + additional_term
 
+        mode, value = self._resolve_q()
+        q_arg = None if mode == "global" else (value if mode == "quantile" else None)
+        logger.info("Q(): integration mode=%s, q=%s", mode, q_arg)
         for k in range(len(n_vec)):
             for r in range(len(n_vec)):
-                if self.optimization_position == "global":
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
-                    Q[k, r] = scipy.integrate.quad(
-                        q_fun,
-                        lower_limit,
-                        upper_limit,
-                        args=(k, r),
-                    )[0]
-                # if optimization position is a number use it as argument of q_fun
-                elif isinstance(self.optimization_position, (int, float)):
-                    Q[k, r] = q_fun(self.optimization_position, k, r)
-                elif isinstance(self.optimization_position, str) and self.optimization_position.startswith("quantile_"):
-                    q = float(self.optimization_position.split("_")[1])
-                    lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100, threshold_lower=q)
-                    logger.info("Integration limits for Q[%s, %s]: %s, %s", k, r, lower_limit, upper_limit)
-                    Q[k, r] = scipy.integrate.quad(
-                        q_fun,
-                        lower_limit,
-                        upper_limit,
-                        args=(k, r),
-                    )[0]
+                if mode == "point":
+                    Q[k, r] = q_fun(value, k, r)
                 else:
-                    raise ValueError(
-                        "Optimization position must be 'global' or a number. Got: {}".format(self.optimization_position)
+                    Q[k, r] = self._integrate_y(
+                        lambda y, k=k, r=r: q_fun(y, k, r), q=q_arg
                     )
         logger.info("Q matrix computed: %s", Q)
         return Q
 
-    def D(self):
-        """Compute the stability criterion D from Lemma (positive definiteness of Q).
+    def D(self, q=None):
+        """Compute the stability criterion D from the Lemma (positive definiteness of Q).
 
-        D = integral of [2*m*b_0(y)*b_2(y) + V_2(y)] dy
+        D_q = integral_{F_X(y) >= q} [2*m*b_0(y)*b_2(y) + V_2(y)] dy
 
         With equal block sizes n_i=n, the Hessian Q has eigenvalues:
           - a = D  (multiplicity m-1, smallest)
           - a + m*b  (multiplicity 1, largest)  where b = integral b_1^2 dy
 
         Q is positive definite iff D > 0 (Lemma in the paper).
+
+        Parameters
+        ----------
+        q : float in (0, 1) or None, optional
+            Lower-tail quantile defining the integration domain
+            ``{y : F_X(y) >= q}``.  This matches the ``D_q`` definition used in
+            the asymptotic analysis (Appendix A.1).
+            If ``None`` (default) the value is taken from
+            ``self.optimization_position``:
+              * ``"global"``                 -> integrate over (essentially) the
+                full support of ``F_X`` (using ``threshold_lower=1e-6``).  This
+                is the *legacy* behaviour and is **not** the quantity bounded
+                by Theorem 4.3 -- for heavy-tailed distributions the bulk of
+                ``F_X`` can dominate the integral and produce phase boundaries
+                that do not follow ``m < C * n^(1+gamma/2)``.
+              * ``"quantile_X"`` (with ``X`` a float) -> use ``q = X``.
+              * a number -> evaluate the integrand pointwise at that y (no
+                integration).
+            An explicit ``q`` argument takes precedence over
+            ``optimization_position``.
         """
         n = np.mean(self.n_vec)
+
         def q_fun(y):
             additional_term = (
                     2
@@ -584,11 +650,15 @@ class BandwidthCalculator:
                 )
             additional_term += self.V_2a_i(y, n) + self.V_2b_i(y, n)
             return additional_term
-        
-        # find the correct integration limits
-        lower_limit, upper_limit = self.find_upper_lower_limits(self.cdf, 100, 100)
-        logger.info("Integration limits found: %s, %s", lower_limit, upper_limit)
-        return scipy.integrate.quad(q_fun, lower_limit, upper_limit)[0]
+
+        # Resolve which integration domain to use.
+        if q is None:
+            mode, value = self._resolve_q()
+            if mode == "point":
+                return q_fun(value)
+            q = None if mode == "global" else value
+
+        return self._integrate_y(q_fun, q=q)
 
     def compute_optimal_global_bandwidth(self):
         """Compute the optimal bandwidth for the given samples."""
