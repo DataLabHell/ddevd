@@ -19,6 +19,7 @@ Data Driven Extreme Value Distribution (DDEVD) & related tools for modern extrem
 - Flexible optimization target: global MISE, quantile‑restricted integration (`quantile_q`), or evaluation at a fixed value
 - Custom kernel support (supply PDF & CDF of kernel)
 - Built‑in normal kernel + optional data‑driven Weibull kernel helper
+- Monotone data transformations (`log`, `sqrt`, `power`, `boxcox`, `affine`, or custom) for fitting on a transformed scale while keeping predictions on the original y‑scale
 - Bootstrap return level uncertainty estimation
 - Lightweight dependency footprint (NumPy / SciPy / tqdm)
 
@@ -139,7 +140,8 @@ DDEVD(data: list[list[float]],
 			kernel_functions: tuple[Callable, Callable] | None = None,
 			target_distribution = scipy.stats.norm,
 			max_bins: int = 100,
-			use_scaling: bool = False)
+			use_scaling: bool = False,
+			transform: Transform | str | None = None)
 ```
 Methods:
 - `cdf(y, mode="binwise"|"global", alternative_data=None)` – Vectorized CDF
@@ -170,6 +172,35 @@ dist = DDEVD(data, kernel_functions=ddevd_weibull_kernel(data))
 ```
 
 If binwise optimization fails (negative bandwidths) the implementation falls back to global bandwidth.
+
+## Data Transformations
+
+`ddevd.transforms` provides strictly monotone differentiable maps \( T: Y \to Z \) so DDEVD can be fitted on a transformed scale while `cdf`, `quantile`, and `return_levels` continue to accept and return y‑scale values. Fitting on \(Z = T(Y)\) is equivalent to a locally adaptive bandwidth in y‑space,
+
+$$ h_Y(y) = h_Z / |T'(y)|, $$
+
+so a compressing transform (e.g. `log`, `sqrt`) automatically widens the bandwidth in the heavy upper tail.
+
+Built‑in transforms:
+
+- `Identity` – no‑op
+- `Log(eps=0.0)` – `z = log(y + eps)`
+- `Sqrt` – `z = sqrt(y)` (non‑negative y)
+- `Power(p)` – `z = y**p` for `p > 0`
+- `Affine(a, b)` – `z = a*y + b`
+- `BoxCox(lam)` – one‑parameter Box–Cox (requires `y > 0`)
+- `Transform.from_callable(forward, inverse, derivative=None)` – user‑supplied map
+
+The `transform` argument accepts a `Transform` instance, the strings `"log"` / `"sqrt"` / `"identity"`, or `None`.
+
+```python
+from ddevd.ddevd import DDEVD
+from ddevd.transforms import Log, BoxCox
+
+dist = DDEVD(data, transform="log")          # fit on log‑scale
+dist = DDEVD(data, transform=BoxCox(lam=0.3))
+rl = dist.return_levels([10, 50])             # still on the original y‑scale
+```
 
 ## Return Levels & Periods
 
