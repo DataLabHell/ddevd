@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from ddevd.evd import ExtremeValueDistribution
 from ddevd.optimal_bandwidth import BandwidthCalculator
+from ddevd.transforms import Transform, Identity, resolve_transform
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -33,6 +34,7 @@ class DDEVD(ExtremeValueDistribution):
         target_distribution = scipy.stats.norm,
         max_bins: int | None = None,
         use_scaling: bool = False,
+        transform: Transform | str | None = None,
     ) -> None:
         """Initialize the DDEVD class.
 
@@ -52,6 +54,14 @@ class DDEVD(ExtremeValueDistribution):
           kernel_functions (tuple[Callable, Callable]): The kernel functions to use for the DDEVD.
             The first function is the kernel-PDF, the second the kernel-CDF.
             If None, the standard normal kernel is used.
+          transform: Optional monotone Y -> Z transform applied to the data
+            before fitting (e.g. ``Log()`` or ``Sqrt()``).  Predictions
+            (``cdf``, ``quantile``, ``return_levels``) accept and return
+            values on the original y-scale; the transform is applied
+            internally.  Equivalent to a locally-adaptive bandwidth
+            ``h_Y(y) = h_Z / |T'(y)|`` in the original scale.  May be a
+            ``Transform`` instance, the string ``"log"`` / ``"sqrt"``, or
+            ``None`` for no transform.
         """
         if len(data) < 1:
             raise ValueError("The number of samples should be at least 1.")
@@ -67,7 +77,12 @@ class DDEVD(ExtremeValueDistribution):
         if len(data) == 0:
             raise ValueError("All samples were removed because they contained less than 10 measurements.")
 
-        super().__init__(data)
+        # The base class applies the forward transform once and stores
+        # ``self.data`` on the z-scale.  Everything downstream uses
+        # ``self.data``.
+        super().__init__(data, transform=transform)
+        if not isinstance(self.transform, Identity):
+            logger.info("DDEVD: data fitted on transform %r", self.transform.name)
 
         self.kernel_pdf = kernel_functions[0] if kernel_functions is not None else norm.pdf
         self.kernel_cdf = kernel_functions[1] if kernel_functions is not None else norm.cdf
@@ -83,15 +98,18 @@ class DDEVD(ExtremeValueDistribution):
         logger.info("Starting optimal bandwidth calculation.")
 
         self.bw_calcs = []
-        if max_bins is not None and len(data) > max_bins:
-            number_of_bins = len(data) // max_bins + 1
-            elements_per_bin = len(data) // number_of_bins
-            num_bins_revised = len(data) // elements_per_bin + 1
+        # Bandwidth optimisation operates on ``self.data`` -- already on the
+        # z-scale if a transform was supplied.
+        z_data = self.data
+        if max_bins is not None and len(z_data) > max_bins:
+            number_of_bins = len(z_data) // max_bins + 1
+            elements_per_bin = len(z_data) // number_of_bins
+            num_bins_revised = len(z_data) // elements_per_bin + 1
             if elements_per_bin < 1:
-                raise ValueError(f"Too many bins ({number_of_bins}) for the given data ({len(data)}).")
+                raise ValueError(f"Too many bins ({number_of_bins}) for the given data ({len(z_data)}).")
             logger.info(f"Data will be split into {number_of_bins} bins with {elements_per_bin} elements each.")
             data_split = [
-                data[i * elements_per_bin : (i + 1) * elements_per_bin]
+                z_data[i * elements_per_bin : (i + 1) * elements_per_bin]
                 for i in range(num_bins_revised)
             ]
             if len(data_split[-1]) == 0:
@@ -110,13 +128,13 @@ class DDEVD(ExtremeValueDistribution):
                         use_scaling=use_scaling
                     )
                 )
-            
+
             self.h_bin_estimates = np.concatenate([bw_calc.compute_optimal_binwise_bandwidth() for bw_calc in self.bw_calcs])
             self.h_global_estimate = np.mean([bw_calc.compute_optimal_global_bandwidth() for bw_calc in self.bw_calcs])
         else:
-            logger.info(f"Data not split, using all {len(data)} measurements.")
+            logger.info(f"Data not split, using all {len(z_data)} measurements.")
             self.bw_calcs = [BandwidthCalculator(
-                [np.array(d) for d in data],
+                [np.array(d) for d in z_data],
                 self.kernel_pdf,
                 self.kernel_cdf,
                 opt_pos,
@@ -130,7 +148,7 @@ class DDEVD(ExtremeValueDistribution):
             raise ValueError("Unable to find optimal bandwidth.")
         elif self.h_bin_estimates is None or any(h is None for h in self.h_bin_estimates):
             logger.warning("The binwise estimate of the optimal bandwidth failed. Using global estimate.")
-            self.h_bin_estimates = [self.h_global_estimate for _ in range(len(data))]
+            self.h_bin_estimates = [self.h_global_estimate for _ in range(len(z_data))]
         else:
             logger.info("Successful optimization of bandwidths.")
 
@@ -155,28 +173,22 @@ class DDEVD(ExtremeValueDistribution):
             diff = (y[:, None] - measurement[None, :]) / h
         return np.mean(self.kernel_cdf(diff), axis=1)
 
-    def cdf(self, y: np.ndarray, mode="binwise", alternative_data=None):
-        """The CDF for the DDEVD using vectorized operations.
+    def _cdf_z(self, z, mode="binwise", alternative_data=None):
+        """Kernel-CDF estimator on the *transformed* z-scale.
 
-        The extreme value CDF is computed from the base data distribution CDF.
+        The base-class ``cdf(y)`` calls this with ``z = forward(y)``; the
+        base-class ``quantile`` bisects this directly in z-space.  All
+        observations referenced here (``self.data`` and any
+        ``alternative_data``) are assumed to be on the same z-scale.
 
         Args:
-          y (np.ndarray): The points at which to evaluate the CDF.
-          mode (str): The mode to use for the CDF estimation. Can be either "binwise" or "global".
-          alternative_data (list[list[float]]): Alternative data to use for the CDF estimation (instead of self.data).
-
-        Returns:
-          np.ndarray: The CDF values.
-
-        Note:
-          If a single value is provided for y, a single value is returned.
+            z: query point(s) on the z-scale (scalar or array-like).
+            mode: ``"binwise"`` (per-block bandwidth) or ``"global"``.
+            alternative_data: optional alternative data list (used by the
+                bootstrap method).  Items must already be on the z-scale.
         """
-        if np.isscalar(y):
-            scalar_input = True
-        else:
-            scalar_input = False
-        y = np.atleast_1d(y)
-
+        scalar_input = np.isscalar(z)
+        z = np.atleast_1d(np.asarray(z, dtype=float))
         match mode:
             case "binwise":
                 h = self.h_bin_estimates
@@ -187,18 +199,19 @@ class DDEVD(ExtremeValueDistribution):
 
         if alternative_data is not None:
             cdf_values = np.array(
-                [self._cdf_estimate(y, meas, h) ** len(meas) for meas, h in zip(alternative_data, h, strict=True)]
+                [self._cdf_estimate(z, meas, h_) ** len(meas)
+                 for meas, h_ in zip(alternative_data, h, strict=True)]
             )
         else:
             cdf_values = np.array(
-                [self._cdf_estimate(y, meas, h) ** len(meas) for meas, h in zip(self.data, h, strict=True)]
+                [self._cdf_estimate(z, meas, h_) ** len(meas)
+                 for meas, h_ in zip(self.data, h, strict=True)]
             )
 
         if scalar_input:
             return np.mean(cdf_values, axis=0).item()
-
         return np.mean(cdf_values, axis=0)
-        
+
     def bootstrap_return_levels(self, return_periods: list[float], n_resample: int = 1000, mode="binwise"):
         """The bootstrap method for the DDEVD.
 
