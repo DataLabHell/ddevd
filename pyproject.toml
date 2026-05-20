@@ -1,7 +1,7 @@
 [project]
 name = "ddevd"
 version = "0.1.0"
-description = "Add your description here"
+description = "Implementation of the Data Driven Extreme Value Distribution"
 readme = "README.md"
 authors = [
     { name = "Michael Sandbichler", email = "michael.sandbichler@datalabhell.at" }
